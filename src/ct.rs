@@ -7,6 +7,7 @@ use std::time::Duration;
 
 use der::Encode;
 use serde::Deserialize;
+use sha2::{Digest, Sha256};
 use spki::SubjectPublicKeyInfoOwned;
 use url::Url;
 
@@ -144,7 +145,7 @@ impl Lookup {
 }
 
 fn sha256(data: &[u8]) -> String {
-    openssl::sha::sha256(data)
+    Sha256::digest(data)
         .iter()
         .map(|byte| format!("{byte:02x}"))
         .collect()
@@ -459,19 +460,28 @@ mod tests {
 
     #[test]
     fn legacy_certificate_lookup_preserves_original_fingerprint() {
-        let cert = include_bytes!("../tests/fixtures/securenet-class-b.pem");
-        let key = crate::parse_spki(cert).unwrap().0;
-        let hash = "b3c962d34019fb38ab9fe9c62399742ab26c43c2d18ce3f2b13c14321e52964b";
-        assert_eq!(sha256(&crate::decode_input(cert).unwrap()), hash);
-        let (mut lookup, requests, handle) =
-            server(vec![("404 Not Found", r#"{"error":"not found"}"#)], None);
-        let (query, details) = lookup.details(cert, &key).unwrap();
-        assert_eq!(query, Query::Certificate(hash.into()));
-        assert!(details.certificates.is_empty());
-        handle.join().unwrap();
-        let request = requests.recv().unwrap();
-        assert!(request.contains(&format!("/v1/cert/{hash}")));
-        assert!(!request.to_lowercase().contains("authorization"));
+        for (cert, hash) in [
+            (
+                include_bytes!("../tests/fixtures/securenet-class-b.pem").as_slice(),
+                "b3c962d34019fb38ab9fe9c62399742ab26c43c2d18ce3f2b13c14321e52964b",
+            ),
+            (
+                include_bytes!("../tests/fixtures/startcom-g2.pem").as_slice(),
+                "1bc400808ab07b775c811c631d75ab38fe7be7df6967f5b384bfe8dc9ef807c6",
+            ),
+        ] {
+            let key = crate::parse_spki(cert).unwrap().0;
+            assert_eq!(sha256(&crate::decode_input(cert).unwrap()), hash);
+            let (mut lookup, requests, handle) =
+                server(vec![("404 Not Found", r#"{"error":"not found"}"#)], None);
+            let (query, details) = lookup.details(cert, &key).unwrap();
+            assert_eq!(query, Query::Certificate(hash.into()));
+            assert!(details.certificates.is_empty());
+            handle.join().unwrap();
+            let request = requests.recv().unwrap();
+            assert!(request.contains(&format!("/v1/cert/{hash}")));
+            assert!(!request.to_lowercase().contains("authorization"));
+        }
     }
 
     #[test]

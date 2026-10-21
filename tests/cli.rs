@@ -1,20 +1,39 @@
 use std::io::Write;
 use std::process::{Command, Output, Stdio};
 
-use openssl::asn1::Asn1Object;
-use openssl::bn::{BigNum, BigNumContext};
-use openssl::ec::{EcGroup, EcKey, EcPoint};
-use openssl::pkey::PKey;
+use der::{Decode, Encode, asn1::ObjectIdentifier};
+use spki::SubjectPublicKeyInfoOwned;
 
 fn public_key(oid: &str, scalar: u64) -> Vec<u8> {
-    let nid = Asn1Object::from_str(oid).unwrap().nid();
-    let group = EcGroup::from_curve_name(nid).unwrap();
-    let mut ctx = BigNumContext::new().unwrap();
-    let scalar = BigNum::from_slice(&scalar.to_be_bytes()).unwrap();
-    let mut point = EcPoint::new(&group).unwrap();
-    point.mul_generator2(&group, &scalar, &mut ctx).unwrap();
-    let key = EcKey::from_public_key(&group, &point).unwrap();
-    PKey::from_ec_key(key).unwrap().public_key_to_der().unwrap()
+    let references: serde_json::Value =
+        serde_json::from_str(include_str!("fixtures/ec-vectors.json")).unwrap();
+    let curve = references["curves"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|curve| curve["oid"].as_str() == Some(oid))
+        .unwrap();
+    let vector = curve["vectors"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|vector| vector["scalar"].as_u64() == Some(scalar))
+        .unwrap();
+    let hex = vector["uncompressed"].as_str().unwrap();
+    let point: Vec<u8> = (0..hex.len())
+        .step_by(2)
+        .map(|i| u8::from_str_radix(&hex[i..i + 2], 16).unwrap())
+        .collect();
+    let curve_oid = ObjectIdentifier::new(oid).unwrap().to_der().unwrap();
+    SubjectPublicKeyInfoOwned {
+        algorithm: spki::AlgorithmIdentifierOwned {
+            oid: ObjectIdentifier::new_unwrap("1.2.840.10045.2.1"),
+            parameters: Some(der::asn1::Any::from_der(&curve_oid).unwrap()),
+        },
+        subject_public_key: der::asn1::BitString::from_bytes(&point).unwrap(),
+    }
+    .to_der()
+    .unwrap()
 }
 
 fn run(input: &[u8], args: &[&str]) -> Output {

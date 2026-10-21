@@ -19,6 +19,8 @@ mod ct;
 mod curves;
 
 const OID_EC: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.2.840.10045.2.1");
+const OID_P192: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.2.840.10045.3.1.1");
+const OID_P224: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.3.132.0.33");
 const OID_P256: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.2.840.10045.3.1.7");
 const OID_P384: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.3.132.0.34");
 const OID_P521: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.3.132.0.35");
@@ -347,40 +349,26 @@ fn decode_input(data: &[u8]) -> Result<Vec<u8>, String> {
 }
 
 fn parse_certificate(der_bytes: &[u8]) -> Result<(SubjectPublicKeyInfoOwned, String), String> {
-    match Certificate::from_der(der_bytes) {
-        Ok(cert) => {
-            let tbs = cert.tbs_certificate();
-            return Ok((
-                tbs.subject_public_key_info().clone(),
-                format!("subject \"{}\"", tbs.subject()),
-            ));
-        }
-        Err(error)
-            if matches!(
-                error.kind(),
-                der::ErrorKind::Value {
-                    tag: der::Tag::UtcTime | der::Tag::GeneralizedTime
-                }
-            ) => {}
-        Err(error) => return Err(error.to_string()),
+    if let Ok(cert) = Certificate::from_der(der_bytes) {
+        let tbs = cert.tbs_certificate();
+        return Ok((
+            tbs.subject_public_key_info().clone(),
+            format!("subject \"{}\"", tbs.subject()),
+        ));
     }
 
-    // Some legacy certificates use timezone offsets forbidden by RFC 5280.
-    // Inspect them with OpenSSL without rewriting the signed DER or CT fingerprint.
-    // OpenSSL's decoder accepts trailing data, so check the outer DER boundary first.
+    // Key inspection needs valid structure, not full RFC 5280 conformance.
+    // ASN.1 times may omit seconds or use offsets. Parse without rewriting the
+    // signed DER or fingerprint, and reject trailing data at both boundaries.
     der::asn1::AnyRef::from_der(der_bytes).map_err(|e| e.to_string())?;
-    let cert = openssl::x509::X509::from_der(der_bytes).map_err(|e| e.to_string())?;
-    for time in [cert.not_before(), cert.not_after()] {
-        // Decoding an ASN.1 time string alone does not validate its calendar fields.
-        time.diff(time)
-            .map_err(|e| format!("invalid certificate validity time: {e}"))?;
+    let (remaining, cert) =
+        x509_parser::parse_x509_certificate(der_bytes).map_err(|e| e.to_string())?;
+    if !remaining.is_empty() {
+        return Err("trailing data after X.509 certificate".into());
     }
-    let key_der = cert
-        .public_key()
-        .and_then(|key| key.public_key_to_der())
-        .map_err(|e| format!("cannot extract certificate public key: {e}"))?;
-    let spki = SubjectPublicKeyInfoOwned::from_der(&key_der).map_err(|e| e.to_string())?;
-    Ok((spki, format!("subject {:?}", cert.subject_name())))
+    let spki =
+        SubjectPublicKeyInfoOwned::from_der(cert.public_key().raw).map_err(|e| e.to_string())?;
+    Ok((spki, format!("subject \"{}\"", cert.subject())))
 }
 
 fn parse_spki(data: &[u8]) -> Result<(SubjectPublicKeyInfoOwned, String), String> {
@@ -401,10 +389,10 @@ fn parse_spki(data: &[u8]) -> Result<(SubjectPublicKeyInfoOwned, String), String
 
 /// Splits the range across threads; each walks its chunk by repeated point addition.
 macro_rules! search_curve {
-    ($krate:ident, $point:expr, $lo:expr, $hi:expr, $threads:expr, $found:expr, $done:expr) => {{
-        use $krate::{ProjectivePoint, PublicKey, Scalar};
+    ($krate:ident, $public_key:ty, $point:expr, $lo:expr, $hi:expr, $threads:expr, $found:expr, $done:expr) => {{
+        use $krate::{ProjectivePoint, Scalar};
 
-        let target: ProjectivePoint = PublicKey::from_sec1_bytes($point)
+        let target: ProjectivePoint = <$public_key>::from_sec1_bytes($point)
             .map_err(|e| format!("invalid EC public key point: {e}"))?
             .to_projective();
 
@@ -687,20 +675,37 @@ fn check_key(
     let found = AtomicU64::new(0);
     let done = AtomicBool::new(false);
     let name = match curve {
+        c if c == OID_P192 => {
+            search_curve!(
+                p192,
+                p192::elliptic_curve::PublicKey<p192::NistP192>,
+                point,
+                lo,
+                hi,
+                threads,
+                &found,
+                &done
+            )?;
+            "P-192 (secp192r1)"
+        }
+        c if c == OID_P224 => {
+            search_curve!(p224, p224::PublicKey, point, lo, hi, threads, &found, &done)?;
+            "P-224 (secp224r1)"
+        }
         c if c == OID_P256 => {
-            search_curve!(p256, point, lo, hi, threads, &found, &done)?;
+            search_curve!(p256, p256::PublicKey, point, lo, hi, threads, &found, &done)?;
             "P-256 (secp256r1)"
         }
         c if c == OID_P384 => {
-            search_curve!(p384, point, lo, hi, threads, &found, &done)?;
+            search_curve!(p384, p384::PublicKey, point, lo, hi, threads, &found, &done)?;
             "P-384 (secp384r1)"
         }
         c if c == OID_P521 => {
-            search_curve!(p521, point, lo, hi, threads, &found, &done)?;
+            search_curve!(p521, p521::PublicKey, point, lo, hi, threads, &found, &done)?;
             "P-521 (secp521r1)"
         }
         c if c == OID_K256 => {
-            search_curve!(k256, point, lo, hi, threads, &found, &done)?;
+            search_curve!(k256, k256::PublicKey, point, lo, hi, threads, &found, &done)?;
             "secp256k1"
         }
         other => {
@@ -729,6 +734,7 @@ fn main() -> ExitCode {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use base64ct::{Base64, Encoding};
     use der::Encode;
 
     // Self-signed fixture with private scalar 1; expiry is intentionally irrelevant.
@@ -884,43 +890,66 @@ BQXfGg==
 
     #[test]
     fn parses_legacy_ccadb_certificate() {
-        // SecureNet CA Class B from CCADB's 1999 report uses +1000 validity offsets.
-        let pem = include_bytes!("../tests/fixtures/securenet-class-b.pem");
-        let der = decode_input(pem).unwrap();
-        assert!(matches!(
-            Certificate::from_der(&der).unwrap_err().kind(),
-            der::ErrorKind::Value {
-                tag: der::Tag::UtcTime
-            }
-        ));
-        for input in [pem.as_slice(), der.as_slice()] {
-            let (spki, label) = parse_spki(input).unwrap();
-            assert_eq!(
-                spki.algorithm.oid,
-                ObjectIdentifier::new_unwrap("1.2.840.113549.1.1.1")
-            );
-            assert!(label.contains("SecureNet CA Class B"));
+        // Public CCADB fixtures exercise timezone offsets and omitted seconds.
+        for (pem, subject) in [
+            (
+                include_bytes!("../tests/fixtures/securenet-class-b.pem").as_slice(),
+                "SecureNet CA Class B",
+            ),
+            (
+                include_bytes!("../tests/fixtures/startcom-g2.pem").as_slice(),
+                "StartCom Certification Authority G2",
+            ),
+        ] {
+            let der = decode_input(pem).unwrap();
             assert!(matches!(
-                check_key(&spki, 0, 0, 1).unwrap(),
-                KeyCheck::Unsupported(_)
+                Certificate::from_der(&der).unwrap_err().kind(),
+                der::ErrorKind::Value {
+                    tag: der::Tag::UtcTime
+                }
             ));
+            for input in [pem, der.as_slice()] {
+                let (spki, label) = parse_spki(input).unwrap();
+                assert_eq!(
+                    spki.algorithm.oid,
+                    ObjectIdentifier::new_unwrap("1.2.840.113549.1.1.1")
+                );
+                assert!(label.contains(subject));
+                assert!(matches!(
+                    check_key(&spki, 0, 0, 1).unwrap(),
+                    KeyCheck::Unsupported(_)
+                ));
+            }
         }
     }
 
     #[test]
     fn legacy_certificate_parsing_rejects_invalid_input() {
+        for pem in [
+            include_bytes!("../tests/fixtures/securenet-class-b.pem").as_slice(),
+            include_bytes!("../tests/fixtures/startcom-g2.pem").as_slice(),
+        ] {
+            let der = decode_input(pem).unwrap();
+            let mut trailing = der.clone();
+            trailing.push(0);
+            assert!(parse_spki(&trailing).is_err());
+            assert!(parse_spki(&der[..der.len() - 1]).is_err());
+        }
         let der = decode_input(include_bytes!("../tests/fixtures/securenet-class-b.pem")).unwrap();
-        let mut trailing = der.clone();
-        trailing.push(0);
-        assert!(parse_spki(&trailing).is_err());
-        assert!(parse_spki(&der[..der.len() - 1]).is_err());
-
         for time in [b"990630000000+1000", b"091015235900+1000"] {
             let mut invalid = der.clone();
             let start = invalid.windows(time.len()).position(|w| w == time).unwrap();
             invalid[start + 13..start + 17].copy_from_slice(b"9960");
             assert!(parse_spki(&invalid).is_err());
         }
+        let mut invalid =
+            decode_input(include_bytes!("../tests/fixtures/startcom-g2.pem")).unwrap();
+        let start = invalid
+            .windows(11)
+            .position(|w| w == b"1001010100Z")
+            .unwrap();
+        invalid[start + 2..start + 4].copy_from_slice(b"13");
+        assert!(parse_spki(&invalid).is_err());
     }
 
     #[test]
@@ -930,7 +959,7 @@ BQXfGg==
             ("CERTIFICATE", cert_der),
             ("PUBLIC KEY", p256_spki(7).to_der().unwrap()),
         ] {
-            let base64 = openssl::base64::encode_block(&der);
+            let base64 = Base64::encode_string(&der);
             let mut pem = format!("-----BEGIN {label}-----\n{}\n", &base64[..65]);
             for chunk in base64.as_bytes()[65..].chunks(64) {
                 pem.push_str(std::str::from_utf8(chunk).unwrap());
@@ -956,7 +985,7 @@ BQXfGg==
     #[test]
     fn accepts_pem_body_whitespace_and_line_endings() {
         let (_, der) = pem_rfc7468::decode_vec(TEST_CERT.as_bytes()).unwrap();
-        let base64 = openssl::base64::encode_block(&der);
+        let base64 = Base64::encode_string(&der);
         for ending in ["\n", "\r\n", "\r"] {
             for width in [1, 37, 64, 65, base64.len()] {
                 let mut pem = format!("-----BEGIN CERTIFICATE-----{ending}");
