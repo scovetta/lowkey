@@ -1,15 +1,17 @@
 # lowkey-check
 
-Check whether an elliptic-curve public key was generated from a small private
-scalar. Accepts public keys, X.509 certificates, CSV exports, and live TLS
-certificate chains. Supports **P-192, P-224, P-256, P-384, P-521, secp256k1,
+Check public keys for **small EC private scalars, shared RSA factors, ROCA
+fingerprints, and RSA primes close enough for bounded Fermat factorization**.
+Accepts public keys, X.509 certificates, CSV exports, and live TLS certificate
+chains. EC support includes **P-192, P-224, P-256, P-384, P-521, secp256k1,
 and all 14 RFC 5639 Brainpool curves**. Optional Certificate Transparency (CT)
 lookups enrich weak-key findings with public certificate details from
 [ctlogs.dev](https://ctlogs.dev/).
 
-**An OK result is not a security guarantee.** It only means that the private
-scalar was not found in the requested range. This is not a general weak-key
-detector, certificate validator, or practical attack on properly generated keys.
+**An OK result is not a security guarantee.** It means only that these checks
+found nothing within the selected input corpus and search budgets. This is not
+a comprehensive weak-key detector, certificate validator, or practical attack
+on properly generated keys.
 Only scan systems and data you are authorized to assess.
 
 ## Install
@@ -19,14 +21,14 @@ Only scan systems and data you are authorized to assess.
 When available, download the matching OS/architecture ZIP from
 [GitHub Releases](https://github.com/scovetta/lowkey/releases), extract it, and
 run `lowkey-check.exe --help` on Windows or `./lowkey-check --help` on Linux/macOS
-(run `chmod +x lowkey-check` first if necessary). Rust, Perl, and a separate
+(run `chmod +x lowkey-check` first if necessary). Rust and a separate
 OpenSSL installation are not required to run these binaries.
 
 ### Build from source
 
 Install a current stable [Rust toolchain](https://rustup.rs/) with Cargo
-(Rust 2024 edition support is required). **OpenSSL and Perl are not required.**
-Curve arithmetic, SHA-256, and certificate parsing use Rust implementations.
+(Rust 2024 edition support is required). **OpenSSL is not required.**
+EC and RSA arithmetic, SHA-256, and certificate parsing use Rust implementations.
 TLS still uses rustls with `ring`, which includes native C/assembly, so the
 standard platform build tools remain necessary:
 
@@ -50,7 +52,7 @@ Linux/macOS). Release builds are strongly recommended for scanning.
 ## Quick start
 
 ```powershell
-# Check the default inclusive range, 0-32767.
+# Check EC scalars 0-32767 and run the default RSA checks automatically.
 lowkey-check .\cert.pem
 
 # Check a specific inclusive range using four workers.
@@ -66,7 +68,10 @@ lowkey-check --leaf-only tls://example.com:443
 # Check a CSV export with an explicit column.
 lowkey-check --column "X.509 Certificate (PEM)" .\certificates.csv
 
-# Load public CT details only for certificates whose private scalar is found.
+# Try more Fermat candidates per RSA modulus, or disable Fermat with 0.
+lowkey-check --fermat-steps 10000 .\rsa-cert.pem
+
+# Load public CT details only for certificates with findings.
 lowkey-check --ct-details .\cert.pem
 
 # Check only selected CCADB years (inclusive).
@@ -97,6 +102,56 @@ coordinates for repeated point addition. This variable-time implementation is
 private to key inspection, has not been independently audited, and is **not a
 signing, key-generation, or general-purpose secret-key arithmetic API**.
 
+## RSA checks
+
+RSA keys using `rsaEncryption`, RSASSA-PSS, or RSAES-OAEP SubjectPublicKeyInfo
+algorithm identifiers are checked automatically. RSA checks do not use
+`--range` or `--threads`; those options control EC scanning.
+
+| Check | What a finding means | Limit |
+|-------|----------------------|-------|
+| Shared-factor batch GCD | A nontrivial factor is recovered from relationships between distinct RSA moduli | Only compares keys in the current input corpus, not an external key database |
+| ROCA fingerprint | The modulus matches the structured-prime generation fingerprint associated with CVE-2017-15361 | A fingerprint match is **not factor recovery** or proof of a particular device's provenance |
+| Bounded Fermat | A nontrivial factor is recovered because the factors are exceptionally close, or the modulus is a perfect square | At most **1,000 candidate values per distinct modulus** by default |
+
+Batch GCD uses balanced product and remainder trees, not all-pairs comparison.
+It deduplicates numeric moduli: ordinary certificate/key reuse is **not itself
+a vulnerability**. When a modulus shares different factors with different
+peers, the checker descends the product tree to isolate a proper factor rather
+than mistaking a GCD equal to the whole modulus for a recovered factor.
+Affected duplicate rows are still reported individually.
+
+The comparison corpus is all RSA keys in one CSV, the presented TLS chain
+(or just its leaf with `--leaf-only`), or **all successfully downloaded reports
+across the selected CCADB years**. A standalone key has no other modulus to
+compare against. Inputs and parsed keys are retained in memory for batch
+analysis; larger corpora and product trees require more memory. Cross-year
+CCADB results are printed after the selected reports have been downloaded.
+
+The ROCA detector checks joint membership in the subgroup generated by 65537
+modulo the product of primes through 167, including compatible discrete-log
+congruences. This follows the modern
+[CROCS-MUNI detector](https://github.com/crocs-muni/roca), avoiding the looser
+original per-prime-only fingerprint. Matches print `SUSPECT`, not a recovered
+private key. False positives remain possible; investigate before concluding
+that the key was generated by affected hardware. Actual ROCA factorization is
+not attempted.
+
+Fermat starts at `ceil(sqrt(N))` and tests consecutive candidate values of
+`a` for a square `a^2 - N`. A success verifies the resulting factors multiply
+back to `N`. Set `--fermat-steps N` to change the candidate budget, or
+`--fermat-steps 0` to disable Fermat, including its perfect-square check.
+This is a work-count limit, **not a wall-clock deadline**; larger keys and
+budgets cost more. Moduli already factored by batch GCD skip Fermat, and repeated
+moduli reuse their RSA assessment. Normally generated RSA primes have similar
+bit lengths; that alone does not make them vulnerable to Fermat.
+
+Confirmed factor recoveries print `VULNERABLE` and disclose the factor and
+cofactor, not a reconstructed RSA private key. Both those findings and `SUSPECT`
+ROCA matches produce exit code 1 unless an error takes precedence. These checks
+do not implement Wiener's small-private-exponent attack, signature nonce-reuse
+analysis, or general RSA factorization.
+
 ## Live TLS inputs
 
 URL inputs perform a TLS handshake, not an HTTP request. The URL path, query,
@@ -118,11 +173,12 @@ intermediates and roots are not fetched. Connections and socket I/O have
 ```text
 lowkey-check [OPTIONS] [PATH|URL]
 
-  -r, --range <MIN-MAX|MAX>  Inclusive scalar range (default: 0-32767)
-  -t, --threads <N>         Positive worker count (default: available CPUs)
+  -r, --range <MIN-MAX|MAX>  Inclusive EC scalar range (default: 0-32767)
+      --fermat-steps <N>   RSA Fermat candidates (default: 1000; 0 disables)
+  -t, --threads <N>         Positive EC worker count (default: available CPUs)
       --leaf-only          Check only the leaf certificate for URL inputs
       --column <HEADER>    Select the CSV key column, case-insensitively
-  -q, --quiet              Hide OK and SKIP results; errors remain visible
+  -q, --quiet              Hide OK/SKIP; findings and errors remain visible
       --check-ccadb        Download and scan CCADB reports from 1999 onward
       --year <YEARS>       CCADB: YEAR, MIN-MAX, -MAX, or MIN-
       --ct-details         Load ctlogs.dev details for weak-key findings
@@ -141,7 +197,11 @@ Files and standard input accept a single DER or PEM SubjectPublicKeyInfo
 (`PUBLIC KEY`) or X.509 certificate (`CERTIFICATE`). EC keys must use named-curve
 parameters and a valid SEC1 point. Private-key files, OpenSSH public keys, and
 multi-certificate PEM bundles are not supported; split bundles into individual
-files or use a CSV table. Compressed and uncompressed EC points are supported.
+files or use a CSV table. Bare RSA keys must use SubjectPublicKeyInfo
+(`PUBLIC KEY`), not standalone PKCS#1 (`RSA PUBLIC KEY`) encoding. RSA moduli
+and exponents must be positive, odd integers with `3 <= exponent < modulus`
+and `modulus > 3`; malformed supported keys are errors.
+Compressed and uncompressed EC points are supported.
 PEM Base64 bodies may use nonstandard line widths or ASCII whitespace (as in
 some CCADB exports); boundaries, Base64 content, and DER structure are still
 validated.
@@ -169,14 +229,16 @@ range (`2005-2010`), or a partial range (`-2010` means 1999 through 2010;
 current UTC year and reversed ranges are rejected before any downloads.
 `--year` requires `--check-ccadb`, which cannot be combined with a path or URL.
 This mode requires internet
-access, can take a long time, and checks duplicate certificates again if present
-in the reports. A failed annual download is reported and causes exit code 2
-after the remaining years have been attempted.
+access and can take a long time. Duplicate certificates remain separate output
+rows, but RSA mathematics is cached by numeric modulus. A failed annual
+download is reported and causes exit code 2 after the remaining years and
+successfully downloaded inputs have been processed.
 
 ## Certificate Transparency details
 
 `--ct-details` queries [ctlogs.dev's API](https://api.ctlogs.dev/) **only after
-a private scalar is found**. Without this flag, scans never perform CT lookups.
+a weak-key finding is produced**, including ROCA fingerprint matches. Without
+this flag, scans never perform CT lookups.
 This is enrichment of an existing finding, not a scan of the entire CT corpus.
 
 For certificate inputs (PEM/DER files, CSV cells, CCADB reports, and live TLS),
@@ -211,7 +273,7 @@ encoded key, so compressed and uncompressed encodings can have different hashes.
 
 **Privacy:** opting in sends certificate or public-key fingerprints to
 `api.ctlogs.dev`, which can identify the certificate/key being inspected. No
-private scalar, raw key, or certificate body is uploaded. Requests are sequential,
+private scalar, recovered RSA factor, raw key, or certificate body is uploaded. Requests are sequential,
 have a 30-second timeout and an 8 MiB response limit each, and do not follow
 redirects. Results and failures are cached within each input batch. The CLI does
 not automatically retry rate limits or outages.
@@ -220,31 +282,36 @@ CT details are third-party index metadata, **not verified inclusion proofs,
 revocation checks, or proof of current deployment**. Index coverage, retention,
 and plan limits can omit certificates. Lookup/authentication/rate-limit errors
 remain visible even with `--quiet` and result in exit code 2; the original
-`VULNERABLE` result is printed first and is never downgraded.
+`VULNERABLE` or `SUSPECT` result is printed first and is never downgraded.
 
 ## Results and exit codes
 
 ```text
 VULNERABLE: public key: P-256 (secp256r1) private key is 7 (0x7)
+VULNERABLE: public key: RSA factor recovered by bounded Fermat; factor = 101 (0x65), cofactor = 151 (0x97)
+SUSPECT: public key: RSA ROCA fingerprint match (fingerprint alone does not recover factors or the private key)
 OK: public key: P-256 (secp256r1) private key not in range 0-32767 (4 threads)
-SKIP: not an EC public key (algorithm OID 1.2.840.113549.1.1.1)
+OK: public key: RSA (27 bits): no proper factor recovered by batch GCD; no ROCA fingerprint; Fermat: no factor within 1000 candidates
+SKIP: unsupported public key algorithm OID 1.3.101.112
 ```
 
 CSV and TLS results include a row or chain-index prefix (TLS index 0 is the
 leaf). Unsupported algorithms and named curves are reported as `SKIP`, not
 tested. Invalid encodings and invalid supported-curve points are errors, not
-skips; a batch continues checking its remaining inputs but ultimately fails.
+skips. Invalid RSA key encodings or parameters are also errors. A batch
+continues checking its remaining inputs but ultimately fails.
 Results go to stdout; errors and CCADB progress go to stderr.
 
 | Exit code | Meaning |
 |-----------|---------|
-| `0` | No scalar found in range; may include skipped inputs |
-| `1` | At least one private scalar found, with no errors |
+| `0` | No finding within the corpus and budgets; may include skipped inputs |
+| `1` | At least one EC scalar recovery, RSA factor recovery, or ROCA fingerprint match, with no errors |
 | `2` | Invalid arguments, input, download, connection, CT lookup, or output error |
 
 Errors take precedence over findings in the exit status. Inspect `VULNERABLE`
-output even when the process exits with code 2. Findings expose private scalars:
-protect scan output and replace affected keys and certificates promptly.
+and `SUSPECT` output even when the process exits with code 2. Findings expose
+private scalars and RSA factors: protect scan output and replace confirmed
+affected keys and certificates promptly.
 
 ## Development
 
@@ -259,6 +326,10 @@ reference points for all 20 curves, including compressed/uncompressed encodings
 and boundary scalars. OpenSSL is not used to regenerate expectations during
 tests and is not a development dependency. Brainpool tests also check published
 parameters, group-order identities, invalid points, and range partitioning.
+RSA tests cover published ROCA positive/negative public moduli, an original
+detector false positive, exact Fermat budget boundaries, and shared-factor
+results against a pairwise-GCD oracle. Offline CCADB tests exercise cross-year
+factor reuse and partial-download failures.
 For a manual release-mode throughput measurement:
 
 ```powershell
@@ -271,8 +342,8 @@ cargo test --locked --release --bin lowkey-check brainpool_search_throughput -- 
 to `main`, pull requests, and manual dispatches. It checks formatting and Clippy
 and runs unit/CLI integration tests and release builds on Linux, Windows, and
 macOS. The offline tests do not require CT credentials or contact public CT
-services. Hosted runners provide the standard platform build tools; no OpenSSL
-or Perl setup is needed. Rust build artifacts are cached between runs.
+services. Hosted runners provide the standard platform build tools.
+Rust build artifacts are cached between runs.
 
 Successful build jobs upload 14-day platform packages named
 `lowkey-check-<OS>-<ARCH>`, containing the executable, README, and license.
