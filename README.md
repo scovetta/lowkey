@@ -25,21 +25,16 @@ OpenSSL installation are not required to run these binaries.
 ### Build from source
 
 Install a current stable [Rust toolchain](https://rustup.rs/) with Cargo
-(Rust 2024 edition support is required). The P-192/P-224 and Brainpool backend
-builds a **vendored, statically linked OpenSSL**; a separate OpenSSL installation
-is not needed, but native build tools are:
+(Rust 2024 edition support is required). **OpenSSL and Perl are not required.**
+Curve arithmetic, SHA-256, and certificate parsing use Rust implementations.
+TLS still uses rustls with `ring`, which includes native C/assembly, so the
+standard platform build tools remain necessary:
 
 | Platform | Build prerequisites |
 |----------|---------------------|
-| Windows (MSVC) | Visual Studio C++ Build Tools and native Perl, such as [Strawberry Perl](https://strawberryperl.com/), on `PATH` |
-| Linux | C compiler, make, and Perl |
-| macOS | Xcode Command Line Tools and Perl |
-
-Git for Windows' bundled Perl may lack required modules; use a complete native
-Perl installation. If Perl is not on `PATH`, set `OPENSSL_SRC_PERL` to its
-executable path before building (for example,
-`$env:OPENSSL_SRC_PERL = 'C:\Strawberry\perl\bin\perl.exe'` in PowerShell).
-The first build takes longer because it compiles OpenSSL.
+| Windows (MSVC) | Visual Studio C++ Build Tools and Windows SDK |
+| Linux | C compiler and archiver, such as the `build-essential` package on Debian/Ubuntu |
+| macOS | Xcode Command Line Tools |
 
 Then run from the repository:
 
@@ -92,8 +87,15 @@ lowkey-check --check-ccadb --year 2015-
 Both Brainpool's regular (`r1`) and twisted (`t1`) variants are supported,
 including compressed points. Legacy curves are supported for inspection, not
 recommended for new keys: in particular, 160- and 192-bit curves have insufficient
-strength for modern applications even when the scalar is not small. The original
-P-256/P-384/P-521/secp256k1 searches continue using RustCrypto arithmetic.
+strength for modern applications even when the scalar is not small. All NIST
+and SECG curves use RustCrypto implementations.
+
+Brainpool uses this project's Rust implementation of the published
+[RFC 5639](https://www.rfc-editor.org/rfc/rfc5639) parameters, backed by
+`crypto-bigint` modular arithmetic. It validates SEC1 points and uses projective
+coordinates for repeated point addition. This variable-time implementation is
+private to key inspection, has not been independently audited, and is **not a
+signing, key-generation, or general-purpose secret-key arithmetic API**.
 
 ## Live TLS inputs
 
@@ -144,9 +146,11 @@ PEM Base64 bodies may use nonstandard line widths or ASCII whitespace (as in
 some CCADB exports); boundaries, Base64 content, and DER structure are still
 validated.
 
-Legacy certificate validity dates with timezone offsets are accepted for key
-inspection even though RFC 5280 requires UTC (`Z`). The original certificate
-bytes are preserved for CT fingerprints; this does not validate certificate trust.
+Legacy ASN.1 certificate validity dates with timezone offsets or omitted seconds
+are accepted for key inspection even though RFC 5280 requires UTC (`Z`) and
+seconds. A pure-Rust inspection parser handles these cases while retaining
+structural and public-key checks. The original certificate bytes are preserved
+for CT fingerprints; this does not validate certificate trust.
 
 Files with a `.csv` extension (case-insensitive) are parsed as CSV rather than
 raw key data. The key column contains a PEM public key or certificate; standard
@@ -250,15 +254,25 @@ cargo fmt --check
 cargo clippy --locked --all-targets -- -D warnings
 ```
 
+The checked-in `tests/fixtures/ec-vectors.json` contains independent OpenSSL
+reference points for all 20 curves, including compressed/uncompressed encodings
+and boundary scalars. OpenSSL is not used to regenerate expectations during
+tests and is not a development dependency. Brainpool tests also check published
+parameters, group-order identities, invalid points, and range partitioning.
+For a manual release-mode throughput measurement:
+
+```powershell
+cargo test --locked --release --bin lowkey-check brainpool_search_throughput -- --ignored --nocapture
+```
+
 ## CI and releases
 
 [CI](https://github.com/scovetta/lowkey/actions/workflows/ci.yml) runs on pushes
 to `main`, pull requests, and manual dispatches. It checks formatting and Clippy
 and runs unit/CLI integration tests and release builds on Linux, Windows, and
 macOS. The offline tests do not require CT credentials or contact public CT
-services. Native build prerequisites are provided by the hosted runners; Windows
-explicitly selects Strawberry Perl rather than Git's Perl. Rust build caches
-reduce the cost of compiling vendored OpenSSL.
+services. Hosted runners provide the standard platform build tools; no OpenSSL
+or Perl setup is needed. Rust build artifacts are cached between runs.
 
 Successful build jobs upload 14-day platform packages named
 `lowkey-check-<OS>-<ARCH>`, containing the executable, README, and license.
