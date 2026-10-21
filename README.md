@@ -144,6 +144,10 @@ PEM Base64 bodies may use nonstandard line widths or ASCII whitespace (as in
 some CCADB exports); boundaries, Base64 content, and DER structure are still
 validated.
 
+Legacy certificate validity dates with timezone offsets are accepted for key
+inspection even though RFC 5280 requires UTC (`Z`). The original certificate
+bytes are preserved for CT fingerprints; this does not validate certificate trust.
+
 Files with a `.csv` extension (case-insensitive) are parsed as CSV rather than
 raw key data. The key column contains a PEM public key or certificate; standard
 CSV quoting is required for multiline PEM values. Header matching ignores case

@@ -5,11 +5,10 @@ use std::collections::{HashMap, HashSet};
 use std::io::Write;
 use std::time::Duration;
 
-use der::{Decode, Encode};
+use der::Encode;
 use serde::Deserialize;
 use spki::SubjectPublicKeyInfoOwned;
 use url::Url;
-use x509_cert::Certificate;
 
 const ENDPOINT: &str = "https://api.ctlogs.dev/";
 const BODY_LIMIT: u64 = 8 * 1024 * 1024;
@@ -125,7 +124,7 @@ impl Lookup {
     ) -> Result<(Query, &Details), String> {
         let der = crate::decode_input(input)?;
         // Exact certificate lookup is anonymous; key-reuse searches require Pro.
-        let query = if Certificate::from_der(&der).is_ok() {
+        let query = if crate::parse_certificate(&der).is_ok() {
             Query::Certificate(sha256(&der))
         } else {
             let der = spki
@@ -454,6 +453,23 @@ mod tests {
         handle.join().unwrap();
         let request = requests.recv().unwrap();
         let hash = sha256(&crate::decode_input(cert).unwrap());
+        assert!(request.contains(&format!("/v1/cert/{hash}")));
+        assert!(!request.to_lowercase().contains("authorization"));
+    }
+
+    #[test]
+    fn legacy_certificate_lookup_preserves_original_fingerprint() {
+        let cert = include_bytes!("../tests/fixtures/securenet-class-b.pem");
+        let key = crate::parse_spki(cert).unwrap().0;
+        let hash = "b3c962d34019fb38ab9fe9c62399742ab26c43c2d18ce3f2b13c14321e52964b";
+        assert_eq!(sha256(&crate::decode_input(cert).unwrap()), hash);
+        let (mut lookup, requests, handle) =
+            server(vec![("404 Not Found", r#"{"error":"not found"}"#)], None);
+        let (query, details) = lookup.details(cert, &key).unwrap();
+        assert_eq!(query, Query::Certificate(hash.into()));
+        assert!(details.certificates.is_empty());
+        handle.join().unwrap();
+        let request = requests.recv().unwrap();
         assert!(request.contains(&format!("/v1/cert/{hash}")));
         assert!(!request.to_lowercase().contains("authorization"));
     }

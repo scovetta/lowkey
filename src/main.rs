@@ -346,18 +346,57 @@ fn decode_input(data: &[u8]) -> Result<Vec<u8>, String> {
     }
 }
 
+fn parse_certificate(der_bytes: &[u8]) -> Result<(SubjectPublicKeyInfoOwned, String), String> {
+    match Certificate::from_der(der_bytes) {
+        Ok(cert) => {
+            let tbs = cert.tbs_certificate();
+            return Ok((
+                tbs.subject_public_key_info().clone(),
+                format!("subject \"{}\"", tbs.subject()),
+            ));
+        }
+        Err(error)
+            if matches!(
+                error.kind(),
+                der::ErrorKind::Value {
+                    tag: der::Tag::UtcTime | der::Tag::GeneralizedTime
+                }
+            ) => {}
+        Err(error) => return Err(error.to_string()),
+    }
+
+    // Some legacy certificates use timezone offsets forbidden by RFC 5280.
+    // Inspect them with OpenSSL without rewriting the signed DER or CT fingerprint.
+    // OpenSSL's decoder accepts trailing data, so check the outer DER boundary first.
+    der::asn1::AnyRef::from_der(der_bytes).map_err(|e| e.to_string())?;
+    let cert = openssl::x509::X509::from_der(der_bytes).map_err(|e| e.to_string())?;
+    for time in [cert.not_before(), cert.not_after()] {
+        // Decoding an ASN.1 time string alone does not validate its calendar fields.
+        time.diff(time)
+            .map_err(|e| format!("invalid certificate validity time: {e}"))?;
+    }
+    let key_der = cert
+        .public_key()
+        .and_then(|key| key.public_key_to_der())
+        .map_err(|e| format!("cannot extract certificate public key: {e}"))?;
+    let spki = SubjectPublicKeyInfoOwned::from_der(&key_der).map_err(|e| e.to_string())?;
+    Ok((spki, format!("subject {:?}", cert.subject_name())))
+}
+
 fn parse_spki(data: &[u8]) -> Result<(SubjectPublicKeyInfoOwned, String), String> {
     let der_bytes = decode_input(data)?;
-    if let Ok(cert) = Certificate::from_der(&der_bytes) {
-        let tbs = cert.tbs_certificate();
-        return Ok((
-            tbs.subject_public_key_info().clone(),
-            format!("subject \"{}\"", tbs.subject()),
-        ));
-    }
+    let certificate_error = match parse_certificate(&der_bytes) {
+        Ok(parsed) => return Ok(parsed),
+        Err(error) => error,
+    };
     SubjectPublicKeyInfoOwned::from_der(&der_bytes)
         .map(|s| (s, "public key".to_string()))
-        .map_err(|_| "input is neither a valid X.509 certificate nor a SubjectPublicKeyInfo".into())
+        .map_err(|e| {
+            format!(
+                "input is neither a valid X.509 certificate nor a SubjectPublicKeyInfo \
+                 (certificate: {certificate_error}; public key: {e})"
+            )
+        })
 }
 
 /// Splits the range across threads; each walks its chunk by repeated point addition.
@@ -840,6 +879,47 @@ BQXfGg==
             let (spki, label) = parse_spki(input).unwrap();
             assert_eq!(spki, p256_spki(1));
             assert!(label.contains("lowkey-test"));
+        }
+    }
+
+    #[test]
+    fn parses_legacy_ccadb_certificate() {
+        // SecureNet CA Class B from CCADB's 1999 report uses +1000 validity offsets.
+        let pem = include_bytes!("../tests/fixtures/securenet-class-b.pem");
+        let der = decode_input(pem).unwrap();
+        assert!(matches!(
+            Certificate::from_der(&der).unwrap_err().kind(),
+            der::ErrorKind::Value {
+                tag: der::Tag::UtcTime
+            }
+        ));
+        for input in [pem.as_slice(), der.as_slice()] {
+            let (spki, label) = parse_spki(input).unwrap();
+            assert_eq!(
+                spki.algorithm.oid,
+                ObjectIdentifier::new_unwrap("1.2.840.113549.1.1.1")
+            );
+            assert!(label.contains("SecureNet CA Class B"));
+            assert!(matches!(
+                check_key(&spki, 0, 0, 1).unwrap(),
+                KeyCheck::Unsupported(_)
+            ));
+        }
+    }
+
+    #[test]
+    fn legacy_certificate_parsing_rejects_invalid_input() {
+        let der = decode_input(include_bytes!("../tests/fixtures/securenet-class-b.pem")).unwrap();
+        let mut trailing = der.clone();
+        trailing.push(0);
+        assert!(parse_spki(&trailing).is_err());
+        assert!(parse_spki(&der[..der.len() - 1]).is_err());
+
+        for time in [b"990630000000+1000", b"091015235900+1000"] {
+            let mut invalid = der.clone();
+            let start = invalid.windows(time.len()).position(|w| w == time).unwrap();
+            invalid[start + 13..start + 17].copy_from_slice(b"9960");
+            assert!(parse_spki(&invalid).is_err());
         }
     }
 
