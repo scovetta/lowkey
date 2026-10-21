@@ -2,6 +2,7 @@ use std::io::Write;
 use std::process::{Command, Output, Stdio};
 
 use der::{Decode, Encode, asn1::ObjectIdentifier};
+use num_bigint::BigUint;
 use spki::SubjectPublicKeyInfoOwned;
 
 fn public_key(oid: &str, scalar: u64) -> Vec<u8> {
@@ -48,6 +49,63 @@ fn run(input: &[u8], args: &[&str]) -> Output {
         .unwrap();
     child.stdin.take().unwrap().write_all(input).unwrap();
     child.wait_with_output().unwrap()
+}
+
+fn rsa_public_key(modulus: &BigUint) -> Vec<u8> {
+    #[derive(der::Sequence)]
+    struct RsaKey<'a> {
+        modulus: der::asn1::UintRef<'a>,
+        exponent: der::asn1::UintRef<'a>,
+    }
+    let modulus = modulus.to_bytes_be();
+    let key = RsaKey {
+        modulus: der::asn1::UintRef::new(&modulus).unwrap(),
+        exponent: der::asn1::UintRef::new(&[17]).unwrap(),
+    }
+    .to_der()
+    .unwrap();
+    SubjectPublicKeyInfoOwned {
+        algorithm: spki::AlgorithmIdentifierOwned {
+            oid: ObjectIdentifier::new_unwrap("1.2.840.113549.1.1.1"),
+            parameters: None,
+        },
+        subject_public_key: der::asn1::BitString::from_bytes(&key).unwrap(),
+    }
+    .to_der()
+    .unwrap()
+}
+
+fn run_rsa_csv(moduli: &[u64], args: &[&str]) -> Output {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static NEXT_FILE: AtomicU64 = AtomicU64::new(0);
+    let path = std::env::temp_dir().join(format!(
+        "lowkey-check-rsa-{}-{}.csv",
+        std::process::id(),
+        NEXT_FILE.fetch_add(1, Ordering::Relaxed)
+    ));
+    let file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&path)
+        .unwrap();
+    let mut csv = csv::Writer::from_writer(file);
+    csv.write_record(["Certificate Name", "Public Key"])
+        .unwrap();
+    for (i, modulus) in moduli.iter().enumerate() {
+        let pem = pem_rfc7468::encode_string(
+            "PUBLIC KEY",
+            pem_rfc7468::LineEnding::LF,
+            &rsa_public_key(&BigUint::from(*modulus)),
+        )
+        .unwrap();
+        csv.write_record([format!("rsa-{i}"), pem]).unwrap();
+    }
+    drop(csv.into_inner().unwrap());
+    let mut args = args.to_vec();
+    args.push(path.to_str().unwrap());
+    let output = run(b"", &args);
+    std::fs::remove_file(path).unwrap();
+    output
 }
 
 #[test]
@@ -118,4 +176,121 @@ fn rejects_invalid_ccadb_years_before_network_access() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         assert!(!stderr.contains("Downloading"), "{stderr}");
     }
+}
+
+#[test]
+fn rsa_fermat_obeys_exact_budget_and_reports_verified_factors() {
+    // ceil(sqrt(101 * 151)) = 124; the first success is a = 126.
+    let key = rsa_public_key(&BigUint::from(101u64 * 151));
+    for (budget, expected) in [("0", 0), ("2", 0), ("3", 1)] {
+        let output = run(&key, &["--fermat-steps", budget, "-"]);
+        assert_eq!(output.status.code(), Some(expected), "{output:?}");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        if expected == 1 {
+            assert!(stdout.contains("bounded Fermat"), "{stdout}");
+            assert!(stdout.contains("factor = 101 "), "{stdout}");
+            assert!(stdout.contains("cofactor = 151 "), "{stdout}");
+        } else {
+            assert!(stdout.contains("OK:"), "{stdout}");
+            if budget == "0" {
+                assert!(stdout.contains("Fermat: disabled"), "{stdout}");
+            } else {
+                assert!(stdout.contains("no factor within 2 candidates"), "{stdout}");
+            }
+        }
+        assert!(output.stderr.is_empty(), "{output:?}");
+    }
+    let output = run(&key, &["--quiet", "-"]);
+    assert_eq!(output.status.code(), Some(1), "{output:?}");
+    assert!(String::from_utf8_lossy(&output.stdout).contains("VULNERABLE:"));
+}
+
+#[test]
+fn rsa_shared_factor_check_deduplicates_without_missing_affected_rows() {
+    let n = 101 * 1_000_003;
+    let output = run_rsa_csv(&[n, n], &["--fermat-steps", "0", "--quiet"]);
+    assert_eq!(output.status.code(), Some(0), "{output:?}");
+    assert!(output.stdout.is_empty(), "{output:?}");
+    assert!(output.stderr.is_empty(), "{output:?}");
+
+    let output = run_rsa_csv(
+        &[n, n, 101 * 1_000_033],
+        &["--fermat-steps", "0", "--quiet"],
+    );
+    assert_eq!(output.status.code(), Some(1), "{output:?}");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert_eq!(stdout.matches("batch GCD").count(), 3, "{stdout}");
+    for tag in ["[row 2 rsa-0]", "[row 3 rsa-1]", "[row 4 rsa-2]"] {
+        assert!(stdout.contains(tag), "{stdout}");
+    }
+    assert_eq!(stdout.matches("factor = 101 ").count(), 3, "{stdout}");
+    assert!(output.stderr.is_empty(), "{output:?}");
+}
+
+#[test]
+fn rsa_batch_handles_different_peers_sharing_both_factors() {
+    let output = run_rsa_csv(
+        &[101 * 113, 101 * 131, 113 * 131],
+        &["--fermat-steps", "0", "--quiet"],
+    );
+    assert_eq!(output.status.code(), Some(1), "{output:?}");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert_eq!(stdout.matches("batch GCD").count(), 3, "{stdout}");
+    assert!(output.stderr.is_empty(), "{output:?}");
+}
+
+#[test]
+fn roca_fingerprint_is_not_described_as_recovered_private_key() {
+    // A synthetic member of <65537>; real affected-key references are tested by rsa.rs.
+    let key = rsa_public_key(&BigUint::from(65_537u32).pow(9));
+    let output = run(&key, &["--fermat-steps", "0", "--quiet", "-"]);
+    assert_eq!(output.status.code(), Some(1), "{output:?}");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("SUSPECT:"), "{stdout}");
+    assert!(stdout.contains("ROCA fingerprint match"), "{stdout}");
+    assert!(!stdout.contains("VULNERABLE:"), "{stdout}");
+    assert!(stdout.contains("does not recover"), "{stdout}");
+    assert!(output.stderr.is_empty(), "{output:?}");
+}
+
+#[test]
+fn rsa_ct_errors_preserve_factor_and_fingerprint_findings() {
+    for (modulus, budget, status) in [
+        (BigUint::from(101u32 * 113), "1", "VULNERABLE:"),
+        (BigUint::from(65_537u32).pow(9), "0", "SUSPECT:"),
+    ] {
+        let output = run(
+            &rsa_public_key(&modulus),
+            &["--fermat-steps", budget, "--ct-details", "--quiet", "-"],
+        );
+        assert_eq!(output.status.code(), Some(2), "{output:?}");
+        assert!(String::from_utf8_lossy(&output.stdout).contains(status));
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(stderr.contains("CT lookup:"), "{stderr}");
+        assert!(stderr.contains("Pro key"), "{stderr}");
+    }
+}
+
+#[test]
+fn rsa_without_findings_does_not_attempt_ct_lookup() {
+    let output = run(
+        &rsa_public_key(&BigUint::from(101u64 * 1_000_003)),
+        &["--ct-details", "--quiet", "-"],
+    );
+    assert_eq!(output.status.code(), Some(0), "{output:?}");
+    assert!(output.stdout.is_empty(), "{output:?}");
+    assert!(output.stderr.is_empty(), "{output:?}");
+}
+
+#[test]
+fn malformed_rsa_is_an_error_not_an_unsupported_algorithm() {
+    let mut spki =
+        SubjectPublicKeyInfoOwned::from_der(&rsa_public_key(&BigUint::from(101u32 * 113))).unwrap();
+    // A negative ASN.1 modulus must never be reinterpreted as an unsigned number.
+    spki.subject_public_key =
+        der::asn1::BitString::from_bytes(&[0x30, 6, 2, 1, 0x80, 2, 1, 17]).unwrap();
+    let output = run(&spki.to_der().unwrap(), &["--quiet", "-"]);
+    assert_eq!(output.status.code(), Some(2), "{output:?}");
+    assert!(output.stdout.is_empty(), "{output:?}");
+    assert!(String::from_utf8_lossy(&output.stderr).contains("RSA"));
 }

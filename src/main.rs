@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::net::{TcpStream, ToSocketAddrs};
 use std::path::PathBuf;
@@ -9,6 +10,7 @@ use std::time::Duration;
 
 use clap::Parser;
 use der::{Decode, asn1::ObjectIdentifier};
+use num_bigint::BigUint;
 use rustls::DigitallySignedStruct;
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
 use rustls_pki_types::{CertificateDer, ServerName, UnixTime};
@@ -17,6 +19,7 @@ use x509_cert::Certificate;
 
 mod ct;
 mod curves;
+mod rsa;
 
 const OID_EC: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.2.840.10045.2.1");
 const OID_P192: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.2.840.10045.3.1.1");
@@ -30,19 +33,23 @@ const FIRST_CCADB_YEAR: u64 = 1999;
 #[derive(Parser)]
 #[command(
     version,
-    about = "Check whether an EC public key (or certificate) was generated from a low-value private key.\n\
-             Exit codes: 0 = not found in range, 1 = private key found, 2 = error."
+    about = "Check public keys and certificates for small EC private scalars and RSA mathematical weaknesses.\n\
+             Exit codes: 0 = no finding, 1 = weak-key finding, 2 = error."
 )]
 struct Cli {
     /// Path to a PEM/DER public key or certificate, or an https:// (or tls://host:port) URL
     /// whose server certificate is fetched. Use "-" or omit to read from stdin.
     path: Option<PathBuf>,
 
-    /// Inclusive private key range to check, as "MIN-MAX" or just "MAX".
+    /// Inclusive EC private scalar range to check, as "MIN-MAX" or just "MAX".
     #[arg(short, long, default_value = "0-32767")]
     range: String,
 
-    /// Number of worker threads (default: available CPUs).
+    /// Maximum Fermat candidates per distinct RSA modulus (0 disables Fermat).
+    #[arg(long, default_value_t = 1000)]
+    fermat_steps: u64,
+
+    /// Number of EC worker threads (default: available CPUs).
     #[arg(short, long)]
     threads: Option<std::num::NonZeroUsize>,
 
@@ -55,7 +62,7 @@ struct Cli {
     #[arg(long)]
     column: Option<String>,
 
-    /// Only print vulnerable results (hide OK and SKIP lines).
+    /// Only print findings, including ROCA fingerprint matches (hide OK and SKIP lines).
     #[arg(short, long)]
     quiet: bool,
 
@@ -68,7 +75,7 @@ struct Cli {
     #[arg(long, requires = "check_ccadb", allow_hyphen_values = true)]
     year: Option<String>,
 
-    /// Load ctlogs.dev details for vulnerable certificates (or keys with a Pro API key).
+    /// Load ctlogs.dev details for findings (or keys with a Pro API key).
     /// Sends certificate/SPKI SHA-256 fingerprints only for findings.
     #[arg(long)]
     ct_details: bool,
@@ -483,29 +490,15 @@ fn run() -> Result<bool, String> {
             Some(years) => parse_years(years, this_year)?,
             None => (FIRST_CCADB_YEAR, this_year),
         };
-        let mut any_found = false;
-        let mut failures = 0;
-        for year in first_year..=last_year {
-            eprintln!("Downloading CCADB certificates valid from {year}...");
-            let rows = match fetch_ccadb_year(year) {
-                Ok(rows) => rows,
-                Err(e) => {
-                    eprintln!("error: {year}: {e}");
-                    failures += 1;
-                    continue;
-                }
-            };
-            eprintln!("Checking {} certificates from {year}", rows.len());
-            let rows: Vec<_> = rows
-                .into_iter()
-                .map(|(t, d)| (format!("{year} {t}"), d))
-                .collect();
-            any_found |= check_inputs(&rows, true, &cli, lo, hi, threads, &mut out)?;
-        }
-        if failures > 0 {
-            return Err(format!("{failures} CCADB year(s) failed to download"));
-        }
-        return Ok(any_found);
+        return check_ccadb(
+            first_year..=last_year,
+            &cli,
+            lo,
+            hi,
+            threads,
+            &mut out,
+            fetch_ccadb_year,
+        );
     }
 
     let url = cli.path.as_ref().map(|p| p.to_string_lossy().into_owned());
@@ -532,6 +525,49 @@ fn run() -> Result<bool, String> {
     check_inputs(&inputs, multi, &cli, lo, hi, threads, &mut out)
 }
 
+fn check_ccadb(
+    years: std::ops::RangeInclusive<u64>,
+    cli: &Cli,
+    lo: u64,
+    hi: u64,
+    threads: usize,
+    out: &mut impl Write,
+    mut fetch: impl FnMut(u64) -> Result<Vec<(String, Vec<u8>)>, String>,
+) -> Result<bool, String> {
+    let mut inputs = Vec::new();
+    let mut failures = 0;
+    for year in years {
+        eprintln!("Downloading CCADB certificates valid from {year}...");
+        match fetch(year) {
+            Ok(rows) => {
+                eprintln!("Loaded {} certificates from {year}", rows.len());
+                inputs.extend(
+                    rows.into_iter()
+                        .map(|(tag, data)| (format!("{year} {tag}"), data)),
+                );
+            }
+            Err(e) => {
+                eprintln!("error: {year}: {e}");
+                failures += 1;
+            }
+        }
+    }
+    // A single corpus is essential: a prime reused in different years must still be found.
+    eprintln!(
+        "Checking {} certificates across selected reports",
+        inputs.len()
+    );
+    let result = check_inputs(&inputs, true, cli, lo, hi, threads, out);
+    if failures == 0 {
+        return result;
+    }
+    let message = format!("{failures} CCADB year(s) failed to download");
+    Err(match result {
+        Ok(_) => message,
+        Err(e) => format!("{message}; {e}"),
+    })
+}
+
 /// Downloads the CCADB "All Certificate PEMs" report for certificates valid from `year`.
 fn fetch_ccadb_year(year: u64) -> Result<Vec<(String, Vec<u8>)>, String> {
     let url = format!(
@@ -550,7 +586,55 @@ fn fetch_ccadb_year(year: u64) -> Result<Vec<(String, Vec<u8>)>, String> {
     parse_csv(rdr, None)
 }
 
-/// Checks each input and prints results; returns true if any private key was found.
+struct ParsedInput {
+    spki: SubjectPublicKeyInfoOwned,
+    label: String,
+    rsa: Option<rsa::PublicKey>,
+}
+
+struct RsaCheck {
+    factors: Option<(&'static str, rsa::Factors)>,
+    roca: bool,
+}
+
+fn write_rsa_result(
+    out: &mut impl Write,
+    prefix: &str,
+    label: &str,
+    key: &rsa::PublicKey,
+    result: &RsaCheck,
+    cli: &Cli,
+) -> std::io::Result<bool> {
+    if let Some((method, factors)) = &result.factors {
+        writeln!(
+            out,
+            "{prefix}VULNERABLE: {label}: RSA {method}; factor = {} (0x{:x}), cofactor = {} (0x{:x})",
+            factors.factor, factors.factor, factors.cofactor, factors.cofactor
+        )?;
+    }
+    if result.roca {
+        writeln!(
+            out,
+            "{prefix}SUSPECT: {label}: RSA ROCA fingerprint match (fingerprint alone does not recover factors or the private key)"
+        )?;
+    }
+    let found = result.factors.is_some() || result.roca;
+    if !found && !cli.quiet {
+        let fermat = if cli.fermat_steps == 0 {
+            "disabled".to_string()
+        } else {
+            format!("no factor within {} candidates", cli.fermat_steps)
+        };
+        writeln!(
+            out,
+            "{prefix}OK: {label}: RSA ({} bits): no proper factor recovered by batch GCD; no ROCA fingerprint; Fermat: {fermat}",
+            key.modulus.bits()
+        )?;
+    }
+    Ok(found)
+}
+
+/// Checks each input and prints results; returns true if any weak-key finding was produced.
 /// Input and enrichment errors take precedence over findings in the exit status.
 fn check_inputs(
     inputs: &[(String, Vec<u8>)],
@@ -561,71 +645,119 @@ fn check_inputs(
     threads: usize,
     out: &mut impl Write,
 ) -> Result<bool, String> {
+    let parsed: Vec<Result<ParsedInput, String>> = inputs
+        .iter()
+        .map(|(_, data)| {
+            let (spki, label) = parse_spki(data)?;
+            let rsa = if rsa::is_rsa(&spki) {
+                Some(rsa::PublicKey::from_spki(&spki)?)
+            } else {
+                None
+            };
+            Ok(ParsedInput { spki, label, rsa })
+        })
+        .collect();
+    let moduli: Vec<BigUint> = parsed
+        .iter()
+        .filter_map(|input| input.as_ref().ok()?.rsa.as_ref())
+        .map(|key| key.modulus.clone())
+        .collect();
+    let shared = rsa::batch_shared_factors(&moduli)?;
+    let mut rsa_checks = HashMap::new();
+    for (modulus, factors) in moduli.iter().zip(shared) {
+        rsa_checks.entry(modulus.clone()).or_insert_with(|| {
+            let factors = match factors {
+                Some(factors) => Ok(Some(("shared factor recovered by batch GCD", factors))),
+                None => rsa::fermat_factor(modulus, cli.fermat_steps).map(|factors| {
+                    factors.map(|factors| ("factor recovered by bounded Fermat", factors))
+                }),
+            };
+            factors.map(|factors| RsaCheck {
+                factors,
+                roca: rsa::roca_fingerprint(modulus),
+            })
+        });
+    }
     let mut any_found = false;
     let mut failures = 0;
     let mut ct_lookup = None;
     let output_error = |e| format!("cannot write results: {e}");
-    for (name_tag, data) in inputs.iter() {
+    for ((name_tag, data), input) in inputs.iter().zip(parsed) {
         let prefix = if multi {
             format!("[{name_tag}] ")
         } else {
             String::new()
         };
-        let result = parse_spki(data).and_then(|(spki, label)| {
-            check_key(&spki, lo, hi, threads).map(|result| (spki, label, result))
-        });
-        let write_result = match result {
-            Ok((spki, label, KeyCheck::Supported(name, Some(k)))) => {
-                any_found = true;
-                writeln!(
-                    out,
-                    "{prefix}VULNERABLE: {label}: {name} private key is {k} (0x{k:x})"
-                )
-                .map_err(output_error)?;
-                if cli.ct_details {
-                    // Initialize lazily so clean keys never read CT credentials or query
-                    // the service, and enrichment failures cannot hide this finding.
-                    let result = match ct_lookup.get_or_insert_with(ct::Lookup::new) {
-                        Ok(lookup) => lookup.details(data, &spki),
-                        Err(e) => Err(e.clone()),
-                    };
-                    match result {
-                        Ok((query, details)) => {
-                            ct::write_details(out, &prefix, &query, details)
-                                .map_err(output_error)?;
-                        }
-                        Err(e) => {
-                            eprintln!("error: {prefix}CT lookup: {e}");
-                            failures += 1;
-                        }
-                    }
-                }
-                Ok(())
-            }
-            Ok((_, label, KeyCheck::Supported(name, None))) => {
-                if !cli.quiet {
-                    writeln!(
-                        out,
-                        "{prefix}OK: {label}: {name} private key not in range {lo}-{hi} ({threads} threads)"
-                    )
-                } else {
-                    Ok(())
-                }
-            }
-            Ok((_, _, KeyCheck::Unsupported(reason))) => {
-                if !cli.quiet {
-                    writeln!(out, "{prefix}SKIP: {reason}")
-                } else {
-                    Ok(())
-                }
-            }
+        let input = match input {
+            Ok(input) => input,
             Err(e) => {
                 eprintln!("error: {prefix}{e}");
                 failures += 1;
-                Ok(())
+                continue;
             }
         };
-        write_result.map_err(output_error)?;
+        let found = if let Some(key) = &input.rsa {
+            match &rsa_checks[&key.modulus] {
+                Ok(result) => write_rsa_result(out, &prefix, &input.label, key, result, cli)
+                    .map_err(output_error)?,
+                Err(e) => {
+                    eprintln!("error: {prefix}{e}");
+                    failures += 1;
+                    continue;
+                }
+            }
+        } else {
+            match check_key(&input.spki, lo, hi, threads) {
+                Ok(KeyCheck::Supported(name, Some(k))) => {
+                    writeln!(
+                        out,
+                        "{prefix}VULNERABLE: {}: {name} private key is {k} (0x{k:x})",
+                        input.label
+                    )
+                    .map_err(output_error)?;
+                    true
+                }
+                Ok(KeyCheck::Supported(name, None)) => {
+                    if !cli.quiet {
+                        writeln!(
+                            out,
+                            "{prefix}OK: {}: {name} private key not in range {lo}-{hi} ({threads} threads)",
+                            input.label
+                        )
+                        .map_err(output_error)?;
+                    }
+                    false
+                }
+                Ok(KeyCheck::Unsupported(reason)) => {
+                    if !cli.quiet {
+                        writeln!(out, "{prefix}SKIP: {reason}").map_err(output_error)?;
+                    }
+                    false
+                }
+                Err(e) => {
+                    eprintln!("error: {prefix}{e}");
+                    failures += 1;
+                    continue;
+                }
+            }
+        };
+        any_found |= found;
+        if found && cli.ct_details {
+            // Initialize lazily: findings are printed before any enrichment can fail.
+            let result = match ct_lookup.get_or_insert_with(ct::Lookup::new) {
+                Ok(lookup) => lookup.details(data, &input.spki),
+                Err(e) => Err(e.clone()),
+            };
+            match result {
+                Ok((query, details)) => {
+                    ct::write_details(out, &prefix, &query, details).map_err(output_error)?;
+                }
+                Err(e) => {
+                    eprintln!("error: {prefix}CT lookup: {e}");
+                    failures += 1;
+                }
+            }
+        }
     }
     if failures > 0 {
         return Err(format!("{failures} input(s) could not be fully processed"));
@@ -648,7 +780,7 @@ fn check_key(
 ) -> Result<KeyCheck, String> {
     if spki.algorithm.oid != OID_EC {
         return Ok(KeyCheck::Unsupported(format!(
-            "not an EC public key (algorithm OID {})",
+            "unsupported public key algorithm OID {}",
             spki.algorithm.oid
         )));
     }
@@ -762,6 +894,30 @@ BQXfGg==
         let point = p256::ProjectivePoint::GENERATOR * p256::Scalar::from(value);
         let key = p256::PublicKey::from_affine(point.to_affine()).unwrap();
         ec_spki(OID_P256, &key.to_sec1_bytes())
+    }
+
+    fn rsa_spki(modulus: u64) -> Vec<u8> {
+        #[derive(der::Sequence)]
+        struct RsaKey<'a> {
+            modulus: der::asn1::UintRef<'a>,
+            exponent: der::asn1::UintRef<'a>,
+        }
+        let modulus = BigUint::from(modulus).to_bytes_be();
+        let key = RsaKey {
+            modulus: der::asn1::UintRef::new(&modulus).unwrap(),
+            exponent: der::asn1::UintRef::new(&[17]).unwrap(),
+        }
+        .to_der()
+        .unwrap();
+        SubjectPublicKeyInfoOwned {
+            algorithm: spki::AlgorithmIdentifierOwned {
+                oid: ObjectIdentifier::new_unwrap("1.2.840.113549.1.1.1"),
+                parameters: None,
+            },
+            subject_public_key: der::asn1::BitString::from_bytes(&key).unwrap(),
+        }
+        .to_der()
+        .unwrap()
     }
 
     #[test]
@@ -915,10 +1071,8 @@ BQXfGg==
                     ObjectIdentifier::new_unwrap("1.2.840.113549.1.1.1")
                 );
                 assert!(label.contains(subject));
-                assert!(matches!(
-                    check_key(&spki, 0, 0, 1).unwrap(),
-                    KeyCheck::Unsupported(_)
-                ));
+                assert!(rsa::is_rsa(&spki));
+                assert!(rsa::PublicKey::from_spki(&spki).unwrap().modulus.bits() >= 1024);
             }
         }
     }
@@ -1128,7 +1282,9 @@ M6D0oTlF2JjClk/jQuL+Gn+bjufrSnwPnhYrzjNXazFezsu2QGg3v1H1
     #[test]
     fn unsupported_keys_skip_even_for_single_input() {
         let mut spki = p256_spki(1);
-        spki.algorithm.oid = ObjectIdentifier::new_unwrap("1.2.840.113549.1.1.1");
+        spki.algorithm.oid = ObjectIdentifier::new_unwrap("1.3.101.112");
+        spki.algorithm.parameters = None;
+        spki.subject_public_key = der::asn1::BitString::from_bytes(&[7; 32]).unwrap();
         let cli = Cli::try_parse_from(["lowkey-check"]).unwrap();
         let mut output = Vec::new();
         assert!(
@@ -1148,6 +1304,79 @@ M6D0oTlF2JjClk/jQuL+Gn+bjufrSnwPnhYrzjNXazFezsu2QGg3v1H1
     }
 
     #[test]
+    fn rsa_batch_findings_survive_bad_inputs_and_coexist_with_ec_findings() {
+        let cli = Cli::try_parse_from(["lowkey-check", "--quiet", "--fermat-steps", "0"]).unwrap();
+        let rows = vec![
+            ("broken".into(), b"invalid".to_vec()),
+            ("rsa-a".into(), rsa_spki(101 * 1_000_003)),
+            ("ec".into(), p256_spki(1).to_der().unwrap()),
+            ("rsa-b".into(), rsa_spki(101 * 1_000_033)),
+        ];
+        let mut output = Vec::new();
+        let error = check_inputs(&rows, true, &cli, 1, 1, 1, &mut output).unwrap_err();
+        assert!(error.contains("1 input(s)"));
+        let output = String::from_utf8(output).unwrap();
+        assert!(output.contains("[rsa-a] VULNERABLE:"));
+        assert!(output.contains("[rsa-b] VULNERABLE:"));
+        assert_eq!(output.matches("batch GCD").count(), 2);
+        assert!(output.contains("[ec] VULNERABLE:"));
+        assert!(!output.contains("OK:"));
+    }
+
+    #[test]
+    fn ccadb_compares_rsa_moduli_across_all_selected_years() {
+        let cli = Cli::try_parse_from(["lowkey-check", "--quiet", "--fermat-steps", "0"]).unwrap();
+        let mut output = Vec::new();
+        let found = check_ccadb(2000..=2001, &cli, 0, 0, 1, &mut output, |year| {
+            let q = if year == 2000 { 1_000_003 } else { 1_000_033 };
+            Ok(vec![("row 2".into(), rsa_spki(101 * q))])
+        })
+        .unwrap();
+        assert!(found);
+        let output = String::from_utf8(output).unwrap();
+        assert!(output.contains("[2000 row 2] VULNERABLE:"));
+        assert!(output.contains("[2001 row 2] VULNERABLE:"));
+        assert_eq!(output.matches("batch GCD").count(), 2);
+    }
+
+    #[test]
+    fn ccadb_download_and_input_errors_preserve_cross_year_findings() {
+        let cli = Cli::try_parse_from(["lowkey-check", "--quiet", "--fermat-steps", "0"]).unwrap();
+        let mut attempted = Vec::new();
+        let mut output = Vec::new();
+        let error = check_ccadb(2000..=2003, &cli, 0, 0, 1, &mut output, |year| {
+            attempted.push(year);
+            match year {
+                2000 => Ok(vec![("row 2".into(), rsa_spki(101 * 1_000_003))]),
+                2001 => Err("test download failure".into()),
+                2002 => Ok(vec![("row 2".into(), rsa_spki(101 * 1_000_033))]),
+                2003 => Ok(vec![("row 2".into(), b"invalid".to_vec())]),
+                _ => unreachable!(),
+            }
+        })
+        .unwrap_err();
+        assert_eq!(attempted, vec![2000, 2001, 2002, 2003]);
+        assert!(error.contains("1 CCADB year(s) failed to download"));
+        assert!(error.contains("1 input(s) could not be fully processed"));
+        assert_eq!(
+            String::from_utf8(output)
+                .unwrap()
+                .matches("batch GCD")
+                .count(),
+            2
+        );
+    }
+
+    #[test]
+    fn fermat_budget_has_a_bounded_default_and_accepts_zero() {
+        let cli = Cli::try_parse_from(["lowkey-check"]).unwrap();
+        assert_eq!(cli.fermat_steps, 1000);
+        let cli = Cli::try_parse_from(["lowkey-check", "--fermat-steps", "0"]).unwrap();
+        assert_eq!(cli.fermat_steps, 0);
+        assert!(Cli::try_parse_from(["lowkey-check", "--fermat-steps", "-1"]).is_err());
+    }
+
+    #[test]
     fn output_errors_are_reported() {
         struct FailingWriter;
         impl Write for FailingWriter {
@@ -1159,9 +1388,11 @@ M6D0oTlF2JjClk/jQuL+Gn+bjufrSnwPnhYrzjNXazFezsu2QGg3v1H1
             }
         }
         let cli = Cli::try_parse_from(["lowkey-check"]).unwrap();
-        let rows = vec![(String::new(), p256_spki(1).to_der().unwrap())];
-        let error = check_inputs(&rows, false, &cli, 1, 1, 1, &mut FailingWriter).unwrap_err();
-        assert!(error.contains("cannot write results"));
+        for data in [p256_spki(1).to_der().unwrap(), rsa_spki(101 * 113)] {
+            let rows = vec![(String::new(), data)];
+            let error = check_inputs(&rows, false, &cli, 1, 1, 1, &mut FailingWriter).unwrap_err();
+            assert!(error.contains("cannot write results"));
+        }
     }
 
     #[test]
