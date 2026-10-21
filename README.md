@@ -1,0 +1,276 @@
+# lowkey-check
+
+Check whether an elliptic-curve public key was generated from a small private
+scalar. Accepts public keys, X.509 certificates, CSV exports, and live TLS
+certificate chains. Supports **P-192, P-224, P-256, P-384, P-521, secp256k1,
+and all 14 RFC 5639 Brainpool curves**. Optional Certificate Transparency (CT)
+lookups enrich weak-key findings with public certificate details from
+[ctlogs.dev](https://ctlogs.dev/).
+
+**An OK result is not a security guarantee.** It only means that the private
+scalar was not found in the requested range. This is not a general weak-key
+detector, certificate validator, or practical attack on properly generated keys.
+Only scan systems and data you are authorized to assess.
+
+## Install
+
+### Prebuilt binaries
+
+When available, download the matching OS/architecture ZIP from
+[GitHub Releases](https://github.com/scovetta/lowkey/releases), extract it, and
+run `lowkey-check.exe --help` on Windows or `./lowkey-check --help` on Linux/macOS
+(run `chmod +x lowkey-check` first if necessary). Rust, Perl, and a separate
+OpenSSL installation are not required to run these binaries.
+
+### Build from source
+
+Install a current stable [Rust toolchain](https://rustup.rs/) with Cargo
+(Rust 2024 edition support is required). The P-192/P-224 and Brainpool backend
+builds a **vendored, statically linked OpenSSL**; a separate OpenSSL installation
+is not needed, but native build tools are:
+
+| Platform | Build prerequisites |
+|----------|---------------------|
+| Windows (MSVC) | Visual Studio C++ Build Tools and native Perl, such as [Strawberry Perl](https://strawberryperl.com/), on `PATH` |
+| Linux | C compiler, make, and Perl |
+| macOS | Xcode Command Line Tools and Perl |
+
+Git for Windows' bundled Perl may lack required modules; use a complete native
+Perl installation. If Perl is not on `PATH`, set `OPENSSL_SRC_PERL` to its
+executable path before building (for example,
+`$env:OPENSSL_SRC_PERL = 'C:\Strawberry\perl\bin\perl.exe'` in PowerShell).
+The first build takes longer because it compiles OpenSSL.
+
+Then run from the repository:
+
+```powershell
+cargo install --path . --locked
+lowkey-check --help
+```
+
+Alternatively, `cargo build --release --locked` creates
+`target\release\lowkey-check.exe` on Windows (`target/release/lowkey-check` on
+Linux/macOS). Release builds are strongly recommended for scanning.
+
+## Quick start
+
+```powershell
+# Check the default inclusive range, 0-32767.
+lowkey-check .\cert.pem
+
+# Check a specific inclusive range using four workers.
+lowkey-check --range 1-1000000 --threads 4 .\public-key.der
+
+# Read PEM from standard input ("-" or no path).
+Get-Content -Raw .\public-key.pem | lowkey-check -
+
+# Check every certificate presented by a TLS server.
+lowkey-check https://example.com
+lowkey-check --leaf-only tls://example.com:443
+
+# Check a CSV export with an explicit column.
+lowkey-check --column "X.509 Certificate (PEM)" .\certificates.csv
+
+# Load public CT details only for certificates whose private scalar is found.
+lowkey-check --ct-details .\cert.pem
+
+# Check only selected CCADB years (inclusive).
+lowkey-check --check-ccadb --year 2005-2010
+lowkey-check --check-ccadb --year 2020
+lowkey-check --check-ccadb --year -2010
+lowkey-check --check-ccadb --year 2015-
+```
+
+## Supported curves
+
+| Family | Named curves |
+|--------|--------------|
+| NIST | P-192 (`secp192r1` / `prime192v1`), P-224 (`secp224r1`), P-256 (`secp256r1` / `prime256v1`), P-384 (`secp384r1`), P-521 (`secp521r1`) |
+| SECG | `secp256k1` |
+| Brainpool (RFC 5639) | `brainpoolP160r1`, `brainpoolP160t1`, `brainpoolP192r1`, `brainpoolP192t1`, `brainpoolP224r1`, `brainpoolP224t1`, `brainpoolP256r1`, `brainpoolP256t1`, `brainpoolP320r1`, `brainpoolP320t1`, `brainpoolP384r1`, `brainpoolP384t1`, `brainpoolP512r1`, `brainpoolP512t1` |
+
+Both Brainpool's regular (`r1`) and twisted (`t1`) variants are supported,
+including compressed points. Legacy curves are supported for inspection, not
+recommended for new keys: in particular, 160- and 192-bit curves have insufficient
+strength for modern applications even when the scalar is not small. The original
+P-256/P-384/P-521/secp256k1 searches continue using RustCrypto arithmetic.
+
+## Live TLS inputs
+
+URL inputs perform a TLS handshake, not an HTTP request. The URL path, query,
+and fragment are ignored. Both schemes default to port 443 and support DNS
+names, IPv4, and bracketed IPv6 addresses. Services requiring STARTTLS are not
+supported. TLS negotiation is limited to rustls's supported protocols and
+signature schemes; use a certificate file if a legacy or Brainpool-only server
+cannot negotiate a compatible handshake.
+
+**Live TLS certificates and handshake signatures are deliberately not
+validated.** Expired, self-signed, or untrusted certificates can be inspected,
+but an active intermediary can substitute the key being checked. No application
+data or credentials are sent. The presented chain is checked leaf first; missing
+intermediates and roots are not fetched. Connections and socket I/O have
+10-second timeouts, not a single overall deadline; DNS resolution may take longer.
+
+## Options
+
+```text
+lowkey-check [OPTIONS] [PATH|URL]
+
+  -r, --range <MIN-MAX|MAX>  Inclusive scalar range (default: 0-32767)
+  -t, --threads <N>         Positive worker count (default: available CPUs)
+      --leaf-only          Check only the leaf certificate for URL inputs
+      --column <HEADER>    Select the CSV key column, case-insensitively
+  -q, --quiet              Hide OK and SKIP results; errors remain visible
+      --check-ccadb        Download and scan CCADB reports from 1999 onward
+      --year <YEARS>       CCADB: YEAR, MIN-MAX, -MAX, or MIN-
+      --ct-details         Load ctlogs.dev details for weak-key findings
+  -h, --help               Show help
+  -V, --version            Show version
+```
+
+Range endpoints are unsigned decimal 64-bit integers. A lone maximum means
+`0-MAX`; scalar zero is always excluded because it is not a valid private key.
+The search uses repeated point addition across workers, so time grows linearly
+with the range for **each input**. Very large ranges can take impractically long.
+
+## Input formats
+
+Files and standard input accept a single DER or PEM SubjectPublicKeyInfo
+(`PUBLIC KEY`) or X.509 certificate (`CERTIFICATE`). EC keys must use named-curve
+parameters and a valid SEC1 point. Private-key files, OpenSSH public keys, and
+multi-certificate PEM bundles are not supported; split bundles into individual
+files or use a CSV table. Compressed and uncompressed EC points are supported.
+PEM Base64 bodies may use nonstandard line widths or ASCII whitespace (as in
+some CCADB exports); boundaries, Base64 content, and DER structure are still
+validated.
+
+Files with a `.csv` extension (case-insensitive) are parsed as CSV rather than
+raw key data. The key column contains a PEM public key or certificate; standard
+CSV quoting is required for multiline PEM values. Header matching ignores case
+and surrounding whitespace. Auto-detection prefers a header containing
+`public key`, then one containing `pem`, then a header exactly equal to
+`certificate`. Use `--column` for other names or ambiguous tables. Empty key
+cells are ignored; missing fields, malformed rows, and tables with no keys
+produce errors. CSV on standard input is not supported.
+
+`--check-ccadb` downloads the CCADB "All Certificate PEMs" CSV reports from
+`ccadb.my.salesforce-sites.com` for each year from 1999 through the current UTC
+year by default. Use `--year` to select a single year (`2020`), an inclusive
+range (`2005-2010`), or a partial range (`-2010` means 1999 through 2010;
+`2015-` means 2015 through the current UTC year). Years outside 1999 through the
+current UTC year and reversed ranges are rejected before any downloads.
+`--year` requires `--check-ccadb`, which cannot be combined with a path or URL.
+This mode requires internet
+access, can take a long time, and checks duplicate certificates again if present
+in the reports. A failed annual download is reported and causes exit code 2
+after the remaining years have been attempted.
+
+## Certificate Transparency details
+
+`--ct-details` queries [ctlogs.dev's API](https://api.ctlogs.dev/) **only after
+a private scalar is found**. Without this flag, scans never perform CT lookups.
+This is enrichment of an existing finding, not a scan of the entire CT corpus.
+
+For certificate inputs (PEM/DER files, CSV cells, CCADB reports, and live TLS),
+the CLI looks up the **SHA-256 fingerprint of the certificate DER** using
+`/v1/cert/{fingerprint}`. This works anonymously and prints the indexed subject,
+issuer, DNS SANs, serial number, validity, and CT log sightings when provided,
+with a link to the public certificate record. A missing record is reported as
+zero indexed certificates; it does not invalidate the weak-key finding.
+
+Bare public keys do not have a certificate fingerprint. They use
+`/v1/spki/{hash}` to find certificates sharing the exact SHA-256 SPKI fingerprint.
+**ctlogs.dev requires a Pro API key for SPKI searches.** Set `CTLOGS_API_KEY` in
+the environment through your secret-management workflow, then run:
+
+```powershell
+lowkey-check --ct-details .\public-key.pem
+```
+
+The key is sent in an Authorization header, never in a URL or printed output.
+If set, it also authenticates certificate lookups. The CLI does not create an
+account, purchase a plan, or bypass the service's access restrictions. Check the
+provider's current [plans, quotas, and terms](https://api.ctlogs.dev/) before
+using the feature, especially for commercial use. Anonymous requests are
+currently limited to 100 per hour, one at a time.
+
+SPKI searches print the returned issuer, matching name, serial, validity, and
+record links. They follow up to 10 pages; repeated certificate IDs are
+deduplicated. Provider truncation or additional pages beyond that limit produce
+an explicit **results incomplete** notice. Exact certificate lookups do not
+enumerate other certificates reusing the same key. SPKI matching is based on the
+encoded key, so compressed and uncompressed encodings can have different hashes.
+
+**Privacy:** opting in sends certificate or public-key fingerprints to
+`api.ctlogs.dev`, which can identify the certificate/key being inspected. No
+private scalar, raw key, or certificate body is uploaded. Requests are sequential,
+have a 30-second timeout and an 8 MiB response limit each, and do not follow
+redirects. Results and failures are cached within each input batch. The CLI does
+not automatically retry rate limits or outages.
+
+CT details are third-party index metadata, **not verified inclusion proofs,
+revocation checks, or proof of current deployment**. Index coverage, retention,
+and plan limits can omit certificates. Lookup/authentication/rate-limit errors
+remain visible even with `--quiet` and result in exit code 2; the original
+`VULNERABLE` result is printed first and is never downgraded.
+
+## Results and exit codes
+
+```text
+VULNERABLE: public key: P-256 (secp256r1) private key is 7 (0x7)
+OK: public key: P-256 (secp256r1) private key not in range 0-32767 (4 threads)
+SKIP: not an EC public key (algorithm OID 1.2.840.113549.1.1.1)
+```
+
+CSV and TLS results include a row or chain-index prefix (TLS index 0 is the
+leaf). Unsupported algorithms and named curves are reported as `SKIP`, not
+tested. Invalid encodings and invalid supported-curve points are errors, not
+skips; a batch continues checking its remaining inputs but ultimately fails.
+Results go to stdout; errors and CCADB progress go to stderr.
+
+| Exit code | Meaning |
+|-----------|---------|
+| `0` | No scalar found in range; may include skipped inputs |
+| `1` | At least one private scalar found, with no errors |
+| `2` | Invalid arguments, input, download, connection, CT lookup, or output error |
+
+Errors take precedence over findings in the exit status. Inspect `VULNERABLE`
+output even when the process exits with code 2. Findings expose private scalars:
+protect scan output and replace affected keys and certificates promptly.
+
+## Development
+
+```powershell
+cargo test --locked
+cargo fmt --check
+cargo clippy --locked --all-targets -- -D warnings
+```
+
+## CI and releases
+
+[CI](https://github.com/scovetta/lowkey/actions/workflows/ci.yml) runs on pushes
+to `main`, pull requests, and manual dispatches. It checks formatting and Clippy
+and runs unit/CLI integration tests and release builds on Linux, Windows, and
+macOS. The offline tests do not require CT credentials or contact public CT
+services. Native build prerequisites are provided by the hosted runners; Windows
+explicitly selects Strawberry Perl rather than Git's Perl. Rust build caches
+reduce the cost of compiling vendored OpenSSL.
+
+Successful build jobs upload 14-day platform packages named
+`lowkey-check-<OS>-<ARCH>`, containing the executable, README, and license.
+
+To publish a release, update the package version and lockfile, then push a tag
+exactly matching `v<VERSION>` from `Cargo.toml` (for example, `v0.1.0`).
+The [release workflow](.github/workflows/release.yml) verifies the version and
+reuses the full CI workflow before publishing the three platform ZIPs and
+`SHA256SUMS` to GitHub Releases. Tags containing a prerelease suffix create a
+prerelease. Only the publishing job has repository write permission.
+
+Release binaries are unsigned and built for the hosted runners' native OS and
+architecture, not every possible target. On Linux/macOS, run
+`chmod +x lowkey-check` after extracting the ZIP if necessary. The workflow does
+not publish to crates.io.
+
+## License
+
+[MIT](LICENSE).
