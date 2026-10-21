@@ -1,0 +1,24 @@
+[package]
+name = "lowkey-check"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+clap = { version = "4.6.7", features = ["derive"] }
+csv = "1.4.0"
+der = "0.8.2"
+elliptic-curve = { version = "0.14.1", features = ["arithmetic", "sec1"] }
+k256 = { version = "0.14.0", features = ["arithmetic"] }
+openssl = { version = "0.10.81", features = ["vendored"] }
+p256 = { version = "0.14.0", features = ["arithmetic"] }
+p384 = { version = "0.14.0", features = ["arithmetic"] }
+p521 = { version = "0.14.0", features = ["arithmetic"] }
+pem-rfc7468 = { version = "1.0.0", features = ["alloc"] }
+rustls = { version = "0.23.46", default-features = false, features = ["ring", "std", "tls12"] }
+rustls-pki-types = "1.15.1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+spki = "0.8.1"
+ureq = { version = "3.4.2", default-features = false, features = ["rustls"] }
+url = "2.5.8"
+x509-cert = "0.3.0"
