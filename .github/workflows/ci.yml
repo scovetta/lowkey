@@ -39,6 +39,9 @@ jobs:
         run: cargo fmt --all --check
       - name: Run Clippy
         run: cargo clippy --locked --all-targets -- -D warnings
+      - name: Test release script
+        shell: pwsh
+        run: .\scripts\tests\release.Tests.ps1
 
   build:
     name: Build and test (${{ matrix.os }})

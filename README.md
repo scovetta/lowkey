@@ -348,12 +348,53 @@ Rust build artifacts are cached between runs.
 Successful build jobs upload 14-day platform packages named
 `lowkey-check-<OS>-<ARCH>`, containing the executable, README, and license.
 
-To publish a release, update the package version and lockfile, then push a tag
-exactly matching `v<VERSION>` from `Cargo.toml` (for example, `v0.1.0`).
+### Preparing a release
+
+Use [`scripts/release.ps1`](scripts/release.ps1) with **PowerShell 7 or newer**,
+Git, and Cargo with rustfmt and Clippy installed. First commit all changes,
+including the release script, and switch to `main`. The script uses `origin`
+and requires local `main` to contain the current remote `main`.
+
+```powershell
+# Validate the current checkout and preview a release; no version or Git changes.
+pwsh -File .\scripts\release.ps1 -Version 0.2.0
+
+# Update the version, validate, commit, tag, and push after confirmation.
+.\scripts\release.ps1 -Version 0.2.0 -Publish
+
+# Prerelease example.
+.\scripts\release.ps1 -Version 0.2.0-rc.1 -Publish
+```
+
+Use `MAJOR.MINOR.PATCH`, optionally with a prerelease suffix, without a `v`
+prefix or build metadata. The version cannot be lower than the current version.
+A different version updates `Cargo.toml` and the workspace version in
+`Cargo.lock` without upgrading dependencies, then creates a
+`chore: release v<VERSION>` commit. An equal version supports the initial
+release of an already-committed package version without an extra commit.
+
+Both modes run formatting, strict Clippy, release-mode tests, and a release
+build. Preview mode checks the **current** version, not an edited version.
+`-Publish` checks the **updated** version, creates an annotated
+`v<VERSION>` tag, and atomically pushes `main` and the tag. It never force-pushes
+or replaces existing local/remote tags. `-Publish -WhatIf` also previews without
+changing versions or Git refs; `-Publish -Confirm:$false` suppresses the
+confirmation for deliberate automation.
+
+Failed checks stop before the release commit/tag, leaving version edits visible
+for inspection. A failed push retains the local release commit and tag; inspect
+the cause before retrying the atomic push manually. No automatic reset or tag
+deletion is performed. Branch protections and push permissions still apply.
+
+Alternatively, update and commit the package version and lockfile manually,
+then push a tag exactly matching `v<VERSION>` from `Cargo.toml` (for example,
+`v0.1.0`).
 The [release workflow](.github/workflows/release.yml) verifies the version and
 reuses the full CI workflow before publishing the three platform ZIPs and
 `SHA256SUMS` to GitHub Releases. Tags containing a prerelease suffix create a
 prerelease. Only the publishing job has repository write permission.
+The script triggers this workflow; it does not wait for completion or publish
+packages locally. Check the workflow result for successful asset publication.
 
 Release binaries are unsigned and built for the hosted runners' native OS and
 architecture, not every possible target. On Linux/macOS, run
