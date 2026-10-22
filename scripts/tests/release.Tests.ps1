@@ -2,7 +2,7 @@
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 $PSNativeCommandUseErrorActionPreference = $false
-$realCargo = (Get-Command cargo -CommandType Application).Source
+$realCargo = (Get-Command cargo -CommandType Application -TotalCount 1 -ErrorAction Stop).Source
 $releaseScript = Join-Path $PSScriptRoot '..\release.ps1'
 $testRoot = Join-Path ([IO.Path]::GetTempPath()) "lowkey-release-tests-$([guid]::NewGuid().ToString('N'))"
 $calls = [Collections.Generic.List[string]]::new()
@@ -30,7 +30,7 @@ function cargo {
 
 function Invoke-TestGit {
     $Arguments = @($args | ForEach-Object { $_ })
-    $output = & (Get-Command git -CommandType Application).Source @Arguments 2>&1
+    $output = & (Get-Command git -CommandType Application -TotalCount 1 -ErrorAction Stop).Source @Arguments 2>&1
     if ($LASTEXITCODE -ne 0) { throw "git $Arguments failed: $output" }
     return ($output -join "`n")
 }
