@@ -700,7 +700,12 @@ mod tests {
             .filter(|&n| (2..=n.isqrt()).all(|d| n % d != 0))
             .take(2048)
             .collect();
-        let moduli: Vec<_> = primes.chunks_exact(2).map(|p| b(p[0]) * b(p[1])).collect();
+        let moduli: Vec<_> = primes
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|&[p, q]| b(p) * b(q))
+            .collect();
         let results = batch_shared_factors(&moduli).unwrap();
         assert_eq!(results.len(), 1024);
         assert!(results.iter().all(Option::is_none));
