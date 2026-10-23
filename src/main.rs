@@ -19,6 +19,8 @@ use x509_cert::Certificate;
 
 mod ct;
 mod curves;
+mod ec_patterns;
+mod patterns;
 mod rsa;
 
 const OID_EC: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.2.840.10045.2.1");
@@ -45,6 +47,27 @@ struct Cli {
     #[arg(short, long, default_value = "0-32767")]
     range: String,
 
+    /// Structured EC search instead of --range: zero-run, one-run, zeros, or ones.
+    #[arg(
+        long,
+        value_enum,
+        requires_all = ["pattern_bits", "max_candidates"],
+        conflicts_with = "range"
+    )]
+    ec_pattern: Option<patterns::Pattern>,
+
+    /// Minimum matching bits (consecutive for run patterns), within the subgroup-order bit width.
+    #[arg(long, requires = "ec_pattern")]
+    pattern_bits: Option<std::num::NonZeroU16>,
+
+    /// Explicit maximum distinct pattern candidates per EC input; larger spaces are refused.
+    #[arg(long, requires = "ec_pattern")]
+    max_candidates: Option<std::num::NonZeroU64>,
+
+    /// Only scan EC curves with these scalar widths (comma-separated or repeated); RSA is unchanged.
+    #[arg(long, value_name = "BITS", value_delimiter = ',')]
+    filter_bits: Vec<std::num::NonZeroU16>,
+
     /// Maximum Fermat candidates per distinct RSA modulus (0 disables Fermat).
     #[arg(long, default_value_t = 1000)]
     fermat_steps: u64,
@@ -62,7 +85,7 @@ struct Cli {
     #[arg(long)]
     column: Option<String>,
 
-    /// Only print findings, including ROCA fingerprint matches (hide OK and SKIP lines).
+    /// Only print findings, including ROCA fingerprint matches (hide SEARCH, OK and SKIP lines).
     #[arg(short, long)]
     quiet: bool,
 
@@ -597,6 +620,11 @@ struct RsaCheck {
     roca: bool,
 }
 
+enum EcAssessment {
+    Checked(&'static str, Option<BigUint>, String),
+    Unsupported(String),
+}
+
 fn write_rsa_result(
     out: &mut impl Write,
     prefix: &str,
@@ -681,6 +709,7 @@ fn check_inputs(
     let mut any_found = false;
     let mut failures = 0;
     let mut ct_lookup = None;
+    let mut pattern_plans = ec_patterns::Plans::new();
     let output_error = |e| format!("cannot write results: {e}");
     for ((name_tag, data), input) in inputs.iter().zip(parsed) {
         let prefix = if multi {
@@ -696,6 +725,38 @@ fn check_inputs(
                 continue;
             }
         };
+        if input.rsa.is_none() && !cli.filter_bits.is_empty() {
+            match ec_patterns::curve_info(&input.spki) {
+                Ok(ec_patterns::CurveInfo::Supported { name, order, .. })
+                    if !cli
+                        .filter_bits
+                        .iter()
+                        .any(|bits| u64::from(bits.get()) == order.bits()) =>
+                {
+                    if !cli.quiet {
+                        let selected = cli
+                            .filter_bits
+                            .iter()
+                            .map(ToString::to_string)
+                            .collect::<Vec<_>>()
+                            .join(",");
+                        writeln!(
+                            out,
+                            "{prefix}SKIP: {}: {name} ({}-bit scalars) excluded by --filter-bits {selected}",
+                            input.label, order.bits()
+                        )
+                        .map_err(output_error)?;
+                    }
+                    continue;
+                }
+                Err(e) => {
+                    eprintln!("error: {prefix}{e}");
+                    failures += 1;
+                    continue;
+                }
+                _ => {}
+            }
+        }
         let found = if let Some(key) = &input.rsa {
             match &rsa_checks[&key.modulus] {
                 Ok(result) => write_rsa_result(out, &prefix, &input.label, key, result, cli)
@@ -707,8 +768,57 @@ fn check_inputs(
                 }
             }
         } else {
-            match check_key(&input.spki, lo, hi, threads) {
-                Ok(KeyCheck::Supported(name, Some(k))) => {
+            let result = match (cli.ec_pattern, cli.pattern_bits, cli.max_candidates) {
+                (Some(pattern), Some(bits), Some(budget)) => {
+                    match ec_patterns::prepare(
+                        &input.spki,
+                        pattern,
+                        usize::from(bits.get()),
+                        &mut pattern_plans,
+                    ) {
+                        Ok(ec_patterns::Prepared::Supported(key)) => {
+                            if !cli.quiet {
+                                writeln!(
+                                    out,
+                                    "{prefix}SEARCH: {}: {}: {} distinct {} candidates, at least {} matching bits in {}-bit scalars (budget {})",
+                                    input.label, key.name, key.plan.count, pattern, bits, key.plan.width, budget
+                                )
+                                .map_err(output_error)?;
+                            }
+                            key.search(budget.get(), threads).map(|found| {
+                                EcAssessment::Checked(
+                                    key.name,
+                                    found,
+                                    format!(
+                                        "not found among {} distinct {} candidates (at least {} matching bits in {}-bit scalars; {} threads)",
+                                        key.plan.count, pattern, bits, key.plan.width, threads
+                                    ),
+                                )
+                            })
+                        }
+                        Ok(ec_patterns::Prepared::Unsupported(reason)) => {
+                            Ok(EcAssessment::Unsupported(reason))
+                        }
+                        Err(e) => Err(e),
+                    }
+                }
+                (None, None, None) => {
+                    check_key(&input.spki, lo, hi, threads).map(|result| match result {
+                        KeyCheck::Supported(name, found) => EcAssessment::Checked(
+                            name,
+                            found.map(BigUint::from),
+                            format!("not in range {lo}-{hi} ({threads} threads)"),
+                        ),
+                        KeyCheck::Unsupported(reason) => EcAssessment::Unsupported(reason),
+                    })
+                }
+                _ => Err(
+                    "--ec-pattern, --pattern-bits and --max-candidates must be used together"
+                        .into(),
+                ),
+            };
+            match result {
+                Ok(EcAssessment::Checked(name, Some(k), _)) => {
                     writeln!(
                         out,
                         "{prefix}VULNERABLE: {}: {name} private key is {k} (0x{k:x})",
@@ -717,18 +827,18 @@ fn check_inputs(
                     .map_err(output_error)?;
                     true
                 }
-                Ok(KeyCheck::Supported(name, None)) => {
+                Ok(EcAssessment::Checked(name, None, scope)) => {
                     if !cli.quiet {
                         writeln!(
                             out,
-                            "{prefix}OK: {}: {name} private key not in range {lo}-{hi} ({threads} threads)",
+                            "{prefix}OK: {}: {name} private key {scope}",
                             input.label
                         )
                         .map_err(output_error)?;
                     }
                     false
                 }
-                Ok(KeyCheck::Unsupported(reason)) => {
+                Ok(EcAssessment::Unsupported(reason)) => {
                     if !cli.quiet {
                         writeln!(out, "{prefix}SKIP: {reason}").map_err(output_error)?;
                     }
@@ -1337,6 +1447,55 @@ M6D0oTlF2JjClk/jQuL+Gn+bjufrSnwPnhYrzjNXazFezsu2QGg3v1H1
         assert!(output.contains("[2000 row 2] VULNERABLE:"));
         assert!(output.contains("[2001 row 2] VULNERABLE:"));
         assert_eq!(output.matches("batch GCD").count(), 2);
+    }
+
+    #[test]
+    fn ccadb_filters_ec_widths_before_pattern_planning_without_filtering_rsa() {
+        let cli = Cli::try_parse_from([
+            "lowkey-check",
+            "--filter-bits",
+            "384",
+            "--ec-pattern",
+            "zero-run",
+            "--pattern-bits",
+            "383",
+            "--max-candidates",
+            "2",
+            "--fermat-steps",
+            "0",
+        ])
+        .unwrap();
+        let p384 =
+            p384::PublicKey::from_affine(p384::ProjectivePoint::GENERATOR.to_affine()).unwrap();
+        let mut output = Vec::new();
+        let found = check_ccadb(2000..=2001, &cli, 0, 0, 1, &mut output, |year| {
+            let q = if year == 2000 { 1_000_003 } else { 1_000_033 };
+            Ok(vec![
+                ("p256".into(), p256_spki(1).to_der().unwrap()),
+                (
+                    "p384".into(),
+                    ec_spki(OID_P384, &p384.to_sec1_bytes()).to_der().unwrap(),
+                ),
+                ("rsa".into(), rsa_spki(101 * q)),
+            ])
+        })
+        .unwrap();
+        assert!(found);
+        let output = String::from_utf8(output).unwrap();
+        for year in [2000, 2001] {
+            assert!(output.contains(&format!("[{year} p256] SKIP:")), "{output}");
+            assert!(
+                output.contains(&format!("[{year} p384] VULNERABLE:")),
+                "{output}"
+            );
+            assert!(
+                output.contains(&format!("[{year} rsa] VULNERABLE:")),
+                "{output}"
+            );
+        }
+        assert_eq!(output.matches("batch GCD").count(), 2);
+        assert_eq!(output.matches("SEARCH:").count(), 2);
+        assert!(output.contains("384-bit scalars"), "{output}");
     }
 
     #[test]

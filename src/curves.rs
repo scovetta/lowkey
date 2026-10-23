@@ -9,6 +9,7 @@ use crypto_bigint::{
     modular::{FixedMontyForm, FixedMontyParams},
 };
 use der::asn1::ObjectIdentifier;
+use num_bigint::BigUint;
 
 mod params;
 pub(crate) use params::CURVES;
@@ -22,7 +23,6 @@ pub(crate) struct Curve {
     b: &'static str,
     gx: &'static str,
     gy: &'static str,
-    #[cfg(test)]
     order: &'static str,
 }
 
@@ -226,6 +226,82 @@ impl<const L: usize> Group<L> {
         result
     }
 
+    fn add_projective(&self, p: Jacobian<L>, q: Jacobian<L>) -> Jacobian<L> {
+        // Keep the power-of-two table projective; affine conversion would require inversions.
+        if p.z == self.zero {
+            return q;
+        }
+        if q.z == self.zero {
+            return p;
+        }
+        let z1z1 = p.z.square();
+        let z2z2 = q.z.square();
+        let u1 = p.x * z2z2;
+        let u2 = q.x * z1z1;
+        let s1 = p.y * q.z * z2z2;
+        let s2 = q.y * p.z * z1z1;
+        let h = u2 - u1;
+        let r = s2 - s1;
+        if h == self.zero {
+            return if r == self.zero {
+                self.double(p)
+            } else {
+                self.infinity()
+            };
+        }
+        let hh = h.square();
+        let hhh = h * hh;
+        let v = u1 * hh;
+        let x = r.square() - hhh - v.double();
+        Jacobian {
+            x,
+            y: r * (v - x) - s1 * hhh,
+            z: h * p.z * q.z,
+        }
+    }
+
+    fn pattern_point(
+        &self,
+        candidate: &BigUint,
+        weights: &[Jacobian<L>],
+        all_ones: Jacobian<L>,
+    ) -> Jacobian<L> {
+        let ones: u32 = candidate.iter_u64_digits().map(u64::count_ones).sum();
+        let dense = ones as usize > weights.len() / 2;
+        let mut point = if dense { all_ones } else { self.infinity() };
+        for (i, weight) in weights.iter().enumerate() {
+            if candidate.bit(i as u64) != dense {
+                let mut term = *weight;
+                if dense {
+                    term.y = -term.y;
+                }
+                point = self.add_projective(point, term);
+            }
+        }
+        point
+    }
+
+    fn search_pattern(
+        &self,
+        bytes: &[u8],
+        plan: &crate::patterns::Plan,
+        budget: u64,
+        threads: usize,
+    ) -> Result<Option<BigUint>, String> {
+        let target = self.decode(bytes)?;
+        let mut weights = Vec::with_capacity(plan.width);
+        let mut current = self.project(self.generator);
+        let mut all_ones = self.infinity();
+        for _ in 0..plan.width {
+            weights.push(current);
+            all_ones = self.add_projective(all_ones, current);
+            current = self.double(current);
+        }
+        plan.search(budget, threads, |candidate| {
+            self.matches(self.pattern_point(candidate, &weights, all_ones), target)
+        })
+    }
+
     fn matches(&self, point: Jacobian<L>, target: Affine<L>) -> bool {
         if point.z == self.zero {
             return false;
@@ -289,6 +365,22 @@ pub(crate) fn search(
 ) -> Result<Option<u64>, String> {
     with_group!(curve, |group| group.search(point, lo, hi, threads))
         .map_err(|e| format!("cannot check {} public key: {e}", curve.name))
+}
+
+pub(crate) fn order(curve: &Curve) -> BigUint {
+    BigUint::parse_bytes(curve.order.as_bytes(), 16).expect("RFC 5639 subgroup order")
+}
+
+pub(crate) fn search_pattern(
+    curve: &Curve,
+    point: &[u8],
+    plan: &crate::patterns::Plan,
+    budget: u64,
+    threads: usize,
+) -> Result<Option<BigUint>, String> {
+    with_group!(curve, |group| group
+        .search_pattern(point, plan, budget, threads))
+    .map_err(|e| format!("cannot check {} public key: {e}", curve.name))
 }
 
 #[cfg(test)]
@@ -478,6 +570,7 @@ mod tests {
                     assert_eq!(search(curve, &point, 0, 7, threads).unwrap(), Some(7));
                     assert_eq!(search(curve, &point, 8, 10, threads).unwrap(), None);
                 }
+
                 assert_eq!(search(curve, &point, 0, 0, 1).unwrap(), None);
                 assert_eq!(search(curve, &point, 7, 7, 20).unwrap(), Some(7));
                 assert_eq!(
@@ -504,6 +597,75 @@ mod tests {
                 .unwrap(),
                 Some(u64::MAX)
             );
+        }
+    }
+
+    #[test]
+    fn brainpool_pattern_tables_match_independent_points_and_full_width_multiplication() {
+        for reference in references() {
+            let Some(curve) = CURVES
+                .iter()
+                .find(|curve| curve.oid.to_string() == reference.oid)
+            else {
+                continue;
+            };
+            with_group!(curve, |group| {
+                let width = order(curve).bits() as usize;
+                let mut weights = Vec::new();
+                let mut current = group.project(group.generator);
+                let mut all_ones = group.infinity();
+                for _ in 0..width {
+                    weights.push(current);
+                    all_ones = group.add_projective(all_ones, current);
+                    current = group.double(current);
+                }
+                for vector in &reference.vectors {
+                    let target = group.decode(&bytes(&vector.uncompressed)).unwrap();
+                    assert!(group.matches(
+                        group.pattern_point(&BigUint::from(vector.scalar), &weights, all_ones),
+                        target
+                    ));
+                }
+                let inverse = group.decode(&bytes(&reference.order_minus_one)).unwrap();
+                assert!(group.matches(
+                    group.pattern_point(&(order(curve) - 1u8), &weights, all_ones),
+                    inverse
+                ));
+                assert_eq!(
+                    group
+                        .add_projective(group.project(inverse), group.project(group.generator))
+                        .z,
+                    group.zero
+                );
+                for candidate in [
+                    BigUint::from(1u8) << (width - 1),
+                    (BigUint::from(1u8) << (width - 1)) - 1u8,
+                ] {
+                    let scalar = integer(&candidate.to_str_radix(16));
+                    let expected = group.multiply(group.generator, &scalar);
+                    let actual = group.pattern_point(&candidate, &weights, all_ones);
+                    assert_ne!(actual.z, group.zero);
+                    assert_eq!(
+                        actual.x * expected.z.square(),
+                        expected.x * actual.z.square()
+                    );
+                    assert_eq!(
+                        actual.y * expected.z.square() * expected.z,
+                        expected.y * actual.z.square() * actual.z
+                    );
+                }
+                let point = bytes(&reference.vectors[3].compressed);
+                let plan = crate::patterns::Plan::new(
+                    order(curve),
+                    crate::patterns::Pattern::ZeroRun,
+                    width - 3,
+                )
+                .unwrap();
+                assert_eq!(
+                    group.search_pattern(&point, &plan, 100, 3).unwrap(),
+                    Some(BigUint::from(7u8))
+                );
+            });
         }
     }
 

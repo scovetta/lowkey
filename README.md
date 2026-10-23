@@ -1,6 +1,6 @@
 # lowkey-check
 
-Check public keys for **small EC private scalars, shared RSA factors, ROCA
+Check public keys for **small or bit-patterned EC private scalars, shared RSA factors, ROCA
 fingerprints, and RSA primes close enough for bounded Fermat factorization**.
 Accepts public keys, X.509 certificates, CSV exports, and live TLS certificate
 chains. EC support includes **P-192, P-224, P-256, P-384, P-521, secp256k1,
@@ -58,6 +58,9 @@ lowkey-check .\cert.pem
 # Check a specific inclusive range using four workers.
 lowkey-check --range 1-1000000 --threads 4 .\public-key.der
 
+# P-256: check all one-bit private scalars, including positions beyond bit 63.
+lowkey-check --ec-pattern zeros --pattern-bits 255 --max-candidates 256 .\p256-key.pem
+
 # Read PEM from standard input ("-" or no path).
 Get-Content -Raw .\public-key.pem | lowkey-check -
 
@@ -101,6 +104,90 @@ Brainpool uses this project's Rust implementation of the published
 coordinates for repeated point addition. This variable-time implementation is
 private to key inspection, has not been independently audited, and is **not a
 signing, key-generation, or general-purpose secret-key arithmetic API**.
+
+## Structured EC private-key searches
+
+`--ec-pattern` replaces the default small-scalar search with full-width
+enumeration on **all 20 supported curves**. It requires both a bit threshold
+and an explicit per-input candidate budget:
+
+| Pattern | Scalars considered |
+|---------|--------------------|
+| `zeros` | At least `--pattern-bits` zero bits anywhere |
+| `ones` | At least `--pattern-bits` one bits anywhere |
+| `zero-run` | A contiguous run of at least `--pattern-bits` zero bits anywhere |
+| `one-run` | A contiguous run of at least `--pattern-bits` one bits anywhere |
+
+Bits are counted in the subgroup order's fixed bit width, including leading
+zeros inside that width: 256 for P-256, 521 for P-521, and so on. Storage/byte
+padding is **not** counted. Only canonical private scalars `1 <= k < order`
+are considered; zero and out-of-order values are excluded, not reduced modulo
+the order. A scalar with multiple matching runs is enumerated only once.
+
+For example, these commands target **P-256** inputs:
+
+```powershell
+# At least 255 zero bits: all 256 possible one-bit scalars.
+lowkey-check --ec-pattern zeros --pattern-bits 255 --max-candidates 256 .\p256-key.pem
+
+# At least 255 one bits, respecting the curve order.
+lowkey-check --ec-pattern ones --pattern-bits 255 --max-candidates 256 .\p256-key.pem
+
+# A run of 252 zeros at any position, not just leading zeros.
+lowkey-check --ec-pattern zero-run --pattern-bits 252 --max-candidates 200 .\p256-key.pem
+
+# The analogous contiguous-one pattern.
+lowkey-check --ec-pattern one-run --pattern-bits 252 --max-candidates 200 .\p256-key.pem
+```
+
+The CLI computes the **exact number of distinct valid candidates** before
+searching and prints it in a `SEARCH` line, unless `--quiet` is set. Counts are
+cached by curve/pattern within a batch; candidates are generated lazily rather
+than collected in memory. `--threads` controls EC workers. Searches precompute
+generator powers and compare candidate points using the sparser of the scalar
+bits or their complement; arbitrary-size findings are printed in decimal and
+hexadecimal, not truncated to 64 bits.
+
+If the complete candidate count exceeds `--max-candidates`, that input is
+**refused with exit code 2** before any pattern candidate is tested. The count
+and budget remain visible even with `--quiet`. The CLI does not search only a
+prefix and pretend the entire pattern was checked. Other batch inputs continue,
+and any findings remain visible. The budget is per EC input, not per invocation,
+so a large CSV can still require substantial work. It is not a wall-clock limit.
+Bit thresholds must be positive and no larger than each input curve's scalar
+width; mixed-curve batches can therefore contain both valid searches and errors.
+
+Use `--filter-bits 384` to scan only EC curves with 384-bit scalars, or
+`--filter-bits 256,384` (equivalently, repeat the option) to select multiple
+widths. Width means the subject key's subgroup-order bit length, not the
+certificate's signature hash or issuer key size. Supported curves have widths
+160, 192, 224, 256, 320, 384, 512, or 521; a positive width with no matching
+curve simply selects no EC keys. The filter works with both range and pattern
+searches on all input sources, including CCADB:
+
+```powershell
+lowkey-check --check-ccadb --year 2025 --filter-bits 384 --ec-pattern zero-run --pattern-bits 383 --max-candidates 2
+```
+
+Excluded EC keys print `SKIP` unless `--quiet` is set; they do not undergo
+pattern planning, candidate searches, or CT lookup. Malformed supported EC keys
+still produce errors. RSA checks remain unchanged. Without `--filter-bits`, all
+supported EC curves are scanned as before. Pattern threshold and budget errors
+identify the affected curve and scalar width.
+
+**Having about half the bits be zero or one is normal, not a weakness.**
+In a 256-bit scalar, a threshold of 120 or 128 zero bits anywhere still describes
+an enormous portion of the key space. Even 128 specified zero positions leave
+128 unknown bits before scalar-validity constraints. Such searches are not
+practical to enumerate and will exceed realistic budgets. These modes are useful
+for much stronger structure, such as only one or two one bits or an exceptionally
+long uniform run. A successful scalar recovery proves compromise; a pattern
+hypothesis or a clean search result does not prove weak generation or security.
+
+`--ec-pattern` cannot be combined with an explicit `--range`; omit it to retain
+the existing fast inclusive 64-bit range search. RSA checks and opt-in CT
+enrichment work as before. `--ct-details` queries only actual findings, never
+refused searches.
 
 ## RSA checks
 
@@ -174,11 +261,15 @@ intermediates and roots are not fetched. Connections and socket I/O have
 lowkey-check [OPTIONS] [PATH|URL]
 
   -r, --range <MIN-MAX|MAX>  Inclusive EC scalar range (default: 0-32767)
+      --ec-pattern <MODE>  zero-run, one-run, zeros, or ones (instead of range)
+      --pattern-bits <N>   Minimum matching bits; consecutive for run modes
+      --max-candidates <N> Required complete-search budget per EC pattern input
+      --filter-bits <BITS> EC scalar widths, comma-separated or repeated; RSA unchanged
       --fermat-steps <N>   RSA Fermat candidates (default: 1000; 0 disables)
   -t, --threads <N>         Positive EC worker count (default: available CPUs)
       --leaf-only          Check only the leaf certificate for URL inputs
       --column <HEADER>    Select the CSV key column, case-insensitively
-  -q, --quiet              Hide OK/SKIP; findings and errors remain visible
+  -q, --quiet              Hide SEARCH/OK/SKIP; findings and errors remain visible
       --check-ccadb        Download and scan CCADB reports from 1999 onward
       --year <YEARS>       CCADB: YEAR, MIN-MAX, -MAX, or MIN-
       --ct-details         Load ctlogs.dev details for weak-key findings
@@ -188,7 +279,7 @@ lowkey-check [OPTIONS] [PATH|URL]
 
 Range endpoints are unsigned decimal 64-bit integers. A lone maximum means
 `0-MAX`; scalar zero is always excluded because it is not a valid private key.
-The search uses repeated point addition across workers, so time grows linearly
+The range search uses repeated point addition across workers, so time grows linearly
 with the range for **each input**. Very large ranges can take impractically long.
 
 ## Input formats
@@ -306,7 +397,7 @@ Results go to stdout; errors and CCADB progress go to stderr.
 |-----------|---------|
 | `0` | No finding within the corpus and budgets; may include skipped inputs |
 | `1` | At least one EC scalar recovery, RSA factor recovery, or ROCA fingerprint match, with no errors |
-| `2` | Invalid arguments, input, download, connection, CT lookup, or output error |
+| `2` | Invalid arguments, input, pattern budget/width, download, connection, CT lookup, or output error |
 
 Errors take precedence over findings in the exit status. Inspect `VULNERABLE`
 and `SUSPECT` output even when the process exits with code 2. Findings expose

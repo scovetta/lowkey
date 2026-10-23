@@ -15,7 +15,6 @@ macro_rules! curve {
             b: $b,
             gx: $gx,
             gy: $gy,
-            #[cfg(test)]
             order: $order,
         }
     };
