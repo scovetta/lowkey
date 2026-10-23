@@ -84,6 +84,76 @@ lowkey-check --check-ccadb --year -2010
 lowkey-check --check-ccadb --year 2015-
 ```
 
+## CCADB scan runner
+
+PowerShell 7 users can run the multi-pass scanner on Windows, Linux, or macOS:
+
+```powershell
+cargo build --release --locked
+pwsh -File .\scripts\scan-ccadb.ps1 -Year 2025
+
+# All reports from 1999 through the current UTC year (the default).
+pwsh -File .\scripts\scan-ccadb.ps1
+
+# In a PowerShell session, select pattern widths and worker count.
+.\scripts\scan-ccadb.ps1 -Year 2020-2025 -Widths 256,384 -Threads 4
+
+# Broaden contiguous-run searches, with an explicitly larger budget.
+.\scripts\scan-ccadb.ps1 -Year 2025 -RunFreeBits 12 -MaxCandidates 32768
+```
+
+Start with one year to gauge runtime. The default plan makes **33 sequential
+passes**: one baseline pass, then four pattern passes for each supported scalar
+width (160, 192, 224, 256, 320, 384, 512, and 521). Every pass uses the release
+binary in `target\release` if present, otherwise `lowkey-check` on PATH; use
+`-Binary` to select another executable. The script does not build automatically.
+
+| Pass | Settings |
+|------|----------|
+| Baseline | EC scalars 0-32767 on all supported curves; RSA batch GCD, ROCA, and 1,000 Fermat candidates per distinct modulus |
+| `zeros` / `ones`, per width W | At least W-1 matching bits: at most one opposite bit anywhere |
+| `zero-run` / `one-run`, per width W | At least W-10 consecutive matching bits anywhere (configurable with `-RunFreeBits`) |
+
+`-RunFreeBits N` sets the run threshold to **W-N** (default: **10**); it does not
+change the `zeros`/`ones` thresholds. N must be nonnegative and smaller than every
+selected width. Increasing N grows the candidate space exponentially.
+
+Pattern passes filter by width and have a hard **8,192-candidate budget per EC
+input**, configurable with `-MaxCandidates`. The default run searches have at
+most 6,144 candidates per key, so these defaults fit the budget on every supported
+curve. Larger offsets may require an explicitly larger budget; oversized searches
+are refused, not partially scanned. These passes look for
+extreme structure, not ordinary 120/128 zero bits. They cannot exhaust arbitrary
+128-bit unknowns or establish that a key is secure. `-Widths` restricts the
+pattern passes only; the baseline still checks all supported EC curves.
+
+The script downloads each selected annual CCADB report once, then saves one
+combined CSV so RSA factors shared across years remain detectable. Missing,
+empty, or unrecognized reports abort before scanning rather than silently
+claiming complete coverage. `-Year` accepts the CLI's `YEAR`, `MIN-MAX`, `-MAX`,
+and `MIN-` forms. Downloads have a 120-second timeout and up to two retries.
+No CT lookups are enabled. Workers default to at most four.
+
+Each run gets a unique directory under `target\ccadb-scans`, or under
+`-OutputDirectory`. It contains the annual reports, reusable `ccadb.csv`,
+per-pass stdout/stderr logs, and `summary.csv` with pass names and exit codes.
+Quiet mode keeps routine key results out of logs; findings remain in stdout
+logs and errors in stderr logs. Any failed pass is also reported on the console,
+and later passes are still attempted. Overall exit codes are **0** for no
+findings, **1** for findings, and **2** if any pass or download fails.
+
+Reuse the printed snapshot path to run again without downloading:
+
+```powershell
+.\scripts\scan-ccadb.ps1 -InputCsv .\target\ccadb-scans\<run>\ccadb.csv -Widths 384
+```
+
+The snapshot is copied into the new run directory so its inputs remain
+auditable. RSA batch GCD and ROCA repeat in pattern passes because the EC filter
+does not disable RSA; Fermat is disabled after the baseline. Candidate limits
+are per input, not wall-clock limits: a full CCADB corpus can still take a long
+time. A snapshot reflects download time; download again for fresh data.
+
 ## Supported curves
 
 | Family | Named curves |
