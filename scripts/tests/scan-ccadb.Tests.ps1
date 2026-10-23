@@ -221,3 +221,6 @@ finally {
     $env:LOWKEY_TEST_FIXTURE = $oldFixture
     Remove-Item -LiteralPath $root -Recurse -Force
 }
+
+# CI propagates LASTEXITCODE; expected subprocess failures must not fail a successful suite.
+$global:LASTEXITCODE = 0
